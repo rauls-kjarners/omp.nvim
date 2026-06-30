@@ -1,7 +1,7 @@
 # omp.nvim
 
 [![CI](https://github.com/rauls-kjarners/omp.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/rauls-kjarners/omp.nvim/actions/workflows/ci.yml)
-[![npm version](https://badge.fury.io/js/omp.nvim.svg)](https://badge.fury.io/js/omp.nvim)
+[![npm version](https://img.shields.io/npm/v/omp.nvim.svg)](https://www.npmjs.com/package/omp.nvim)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 A seamless integration bridge between Neovim and the Oh My Pi (OMP) coding agent.

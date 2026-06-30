@@ -1,12 +1,12 @@
 {
 	"name": "omp.nvim",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Oh My Pi Neovim Integration",
 	"author": "Oh My Pi Community",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/rkjarners/omp.nvim.git"
+		"url": "git+https://github.com/rauls-kjarners/omp.nvim.git"
 	},
 	"files": [
 		"src",
