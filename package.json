@@ -1,0 +1,49 @@
+{
+	"name": "omp.nvim",
+	"version": "1.0.0",
+	"description": "Oh My Pi Neovim Integration",
+	"author": "Oh My Pi Community",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/rkjarners/omp.nvim.git"
+	},
+	"files": [
+		"src",
+		"lua",
+		"README.md",
+		"package.json"
+	],
+	"engines": {
+		"node": ">=24.0.0"
+	},
+	"keywords": [
+		"omp",
+		"oh-my-pi",
+		"neovim",
+		"nvim",
+		"package",
+		"extension"
+	],
+	"type": "module",
+	"main": "src/extension.ts",
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"watch": "tsc --noEmit -w",
+		"lint": "biome check .",
+		"format": "biome format --write .",
+		"check": "npm run typecheck && npm run lint"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.1",
+		"@oh-my-pi/pi-coding-agent": "^16.2.9",
+		"@types/node": "^24.13.2",
+		"oh-my-pi": "latest",
+		"typescript": "^6.0.3"
+	},
+	"pi": {
+		"extensions": [
+			"./src/extension.ts"
+		]
+	}
+}
