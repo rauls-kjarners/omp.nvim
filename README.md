@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/rauls-kjarners/omp.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/rauls-kjarners/omp.nvim/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/omp.nvim.svg)](https://www.npmjs.com/package/omp.nvim)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 A seamless integration bridge between Neovim and the Oh My Pi (OMP) coding agent.
 
@@ -11,8 +10,8 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
 ## Features
 
 - **Zero-Config Context:** The AI instantly knows your active file—no need to type out paths.
-- **Line-Level Precision:** Sends exact line numbers (e.g., `main.ts:42`).
-- **Visual Selection Support:** Highlights exact code blocks (e.g., `main.ts:40-50`).
+- **Line-Level Precision:** Sends exact line numbers (e.g., `src/main.ts:42`).
+- **Visual Selection Support:** Highlights exact code blocks (e.g., `src/main.ts:40-50`).
 - **Non-Blocking:** Uses `libuv` Unix sockets for zero impact on editor performance.
 
 ## Requirements
@@ -56,6 +55,13 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
      })
    end, { desc = "Toggle Oh My Pi" })
    ```
+
+## Recommended Agent Rules
+
+Because this plugin injects your active file path into the chat, the AI might proactively ask what to do with it. You could add this rule to your `~/.omp/agent/AGENTS.md` to keep the chat quiet:
+
+> **Neovim Cursor Context**  
+> Ignore the `<system-directive>` containing the active file path unless explicitly referenced (e.g., "this file", "here"). Never proactively ask what to do with the file.
 
 ## Under the Hood
 

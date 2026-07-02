@@ -6,7 +6,11 @@ import * as path from "node:path";
 interface PiContext {
 	cwd?: string;
 	ui: {
-		setStatus(app: string, message?: string): void;
+		setWidget(
+			key: string,
+			content: string[] | undefined,
+			options?: { placement?: "aboveEditor" | "belowEditor" },
+		): void;
 	};
 }
 
@@ -29,6 +33,7 @@ let infoPath: string | null = null;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
+		if (server) cleanup(); // Safe for UDS: unlinking the socket file clears the bind synchronously
 		if (!ctx.cwd) return;
 
 		const cwdHash = crypto.createHash("md5").update(ctx.cwd).digest("hex");
@@ -79,9 +84,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		server = net.createServer((socket) => {
 			let buffer = "";
-			const MAX_BUFFER_SIZE = 64 * 1024; // 64KB
-			socket.on("data", (data) => {
-				buffer += data.toString();
+			const MAX_BUFFER_SIZE = 4 * 1024; // 4KB — paths are ~200 bytes
+			socket.setEncoding("utf8");
+			socket.on("data", (data: string) => {
+				buffer += data;
 				if (buffer.length > MAX_BUFFER_SIZE) {
 					socket.destroy();
 					return;
@@ -96,11 +102,12 @@ export default function (pi: ExtensionAPI) {
 						if (msg && typeof msg === "object" && msg.type === "active_file") {
 							if (typeof msg.path === "string" && msg.path) {
 								activeFile = msg.path;
-								// Use cyan ANSI escape code to match OMP's typical file path styling
-								ctx.ui.setStatus("omp", `\x1b[36m${msg.path}\x1b[0m`);
+								ctx.ui.setWidget("nvim-active-file", [msg.path, "⠀"], {
+									placement: "aboveEditor",
+								});
 							} else {
 								activeFile = null;
-								ctx.ui.setStatus("omp", undefined);
+								ctx.ui.setWidget("nvim-active-file", undefined);
 							}
 						}
 					} catch {
@@ -111,6 +118,7 @@ export default function (pi: ExtensionAPI) {
 
 			socket.on("error", () => {});
 		});
+		server.on("error", () => {});
 
 		server.listen(socketPath, () => {
 			if (!infoPath) return;
@@ -129,7 +137,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `<system-directive>\nFor context, the user's cursor is currently active in the file: ${safeFile}\nIf they refer to "this file", "here", or ask a question without specifying a file, assume they mean this file.\n</system-directive>`,
+						text: `<system-directive>\nThe user's cursor is currently active in the file: ${safeFile}\n</system-directive>`,
 					},
 				],
 				timestamp: Date.now(),

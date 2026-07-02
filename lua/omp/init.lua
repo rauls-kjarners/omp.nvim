@@ -50,7 +50,10 @@ local function broadcast_active_file(path)
     if pipe then
       pipe:connect(socket_path, function(err)
         if not err then
-          pipe:write(msg, function()
+          pipe:write(msg, function(write_err)
+            if write_err then
+              active_sockets[socket_path] = nil
+            end
             pipe:close()
           end)
         else
@@ -83,7 +86,7 @@ function M._get_display_path(bufname, buftype, line, v_line, mode)
 end
 
 function M.setup()
-  uv.fs_mkdir(sockets_dir, 511, function() end) -- Ensure it exists
+  uv.fs_mkdir(sockets_dir, 448, function() end) -- 0o700: match TS side, no world-readable race
   sync_sockets()
 
   local group = vim.api.nvim_create_augroup("OmpNvimGroup", { clear = true })
