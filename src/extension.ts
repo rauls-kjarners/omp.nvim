@@ -150,7 +150,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `<system-directive>\nThe user's cursor is currently active in the file: ${safeFile}\n</system-directive>`,
+						text: `<system-directive>\nThe user's cursor is currently active in the file: ${safeFile}\nThis is passive background context, not a request. Do not acknowledge, comment on, or ask what to do with it unless the user explicitly references it (e.g. "this file", "here").\n</system-directive>`,
 					},
 				],
 				timestamp: Date.now(),

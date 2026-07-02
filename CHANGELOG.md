@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-07-02
+
+### Changed
+
+- **Agent behavior:** Tightened the injected system directive to explicitly instruct the agent that the active file is passive background context, stopping the AI from proactively asking what to do with it.
+
 ## [1.1.1] - 2026-07-02
 
 ### Added
@@ -53,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CWD-based matching for multi-project session isolation
 - CI workflow with TypeScript typecheck, Biome lint, and Lua test
 
-[Unreleased]: https://github.com/rauls-kjarners/omp.nvim/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/rauls-kjarners/omp.nvim/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/rauls-kjarners/omp.nvim/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/rauls-kjarners/omp.nvim/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/rauls-kjarners/omp.nvim/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/rauls-kjarners/omp.nvim/releases/tag/v1.0.0

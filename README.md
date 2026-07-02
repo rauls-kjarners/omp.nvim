@@ -56,12 +56,14 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
    end, { desc = "Toggle Oh My Pi" })
    ```
 
-## Recommended Agent Rules
+## Agent Behavior
 
-Because this plugin injects your active file path into the chat, the AI might proactively ask what to do with it. You could add this rule to your `~/.omp/agent/AGENTS.md` to keep the chat quiet:
+This plugin injects your active file path into the chat as passive background context. The
+injected directive already instructs the AI not to acknowledge or ask about it unless you
+reference it directly (e.g. "this file", "here") — no extra setup required.
 
-> **Neovim Cursor Context**  
-> Ignore the `<system-directive>` containing the active file path unless explicitly referenced (e.g., "this file", "here"). Never proactively ask what to do with the file.
+If you want to further tune how your agent handles this (or any other injected context), you
+can add your own rule to `~/.omp/agent/AGENTS.md`, but it's optional.
 
 ## Under the Hood
 
