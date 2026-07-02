@@ -13,24 +13,41 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "24.x"
           cache: "npm"
-          
+
       - name: Install dependencies
         run: npm ci
-        
+
       - name: Run Typecheck and Lint
         run: npm run check
-        
+
       - name: Setup Neovim
         uses: rhysd/action-setup-vim@v1
         with:
           neovim: true
           version: stable
-          
+
+      - name: Install stylua
+        uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: latest
+          args: --check lua/ tests/
+
+      - name: Install luacheck
+        run: |
+          sudo apt-get install -y luarocks
+          sudo luarocks install luacheck
+
+      - name: Run luacheck
+        run: luacheck lua/ tests/
+
       - name: Run Lua Tests
-        run: nvim --headless --cmd "set rtp+=." -l tests/test_path.lua
+        run: |
+          nvim --headless --cmd "set rtp+=." -l tests/test_path.lua
+          nvim --headless --cmd "set rtp+=." -l tests/test_socket_matching.lua

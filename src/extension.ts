@@ -1,10 +1,17 @@
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
+import * as os from "node:os";
 import * as path from "node:path";
 
+interface PiLogger {
+	error(message: string, context?: Record<string, unknown>): void;
+	warn(message: string, context?: Record<string, unknown>): void;
+	info(message: string, context?: Record<string, unknown>): void;
+	debug(message: string, context?: Record<string, unknown>): void;
+}
+
 interface PiContext {
-	cwd?: string;
+	cwd: string;
 	ui: {
 		setWidget(
 			key: string,
@@ -15,6 +22,7 @@ interface PiContext {
 }
 
 interface ExtensionAPI {
+	logger: PiLogger;
 	on(
 		event: "session_start",
 		handler: (_event: unknown, ctx: PiContext) => void | Promise<void>,
@@ -23,8 +31,13 @@ interface ExtensionAPI {
 		event: "context",
 		handler: (event: { messages: unknown[] }) => unknown,
 	): void;
-	on(event: "session_shutdown", handler: () => void | Promise<void>): void;
+	on(
+		event: "session_shutdown",
+		handler: (_event: unknown, _ctx: unknown) => void | Promise<void>,
+	): void;
 }
+
+const MAX_BUFFER_SIZE = 4 * 1024; // 4KB — paths are ~200 bytes
 
 let activeFile: string | null = null;
 let server: net.Server | null = null;
@@ -33,24 +46,22 @@ let infoPath: string | null = null;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		if (server) cleanup(); // Safe for UDS: unlinking the socket file clears the bind synchronously
+		if (server) cleanup();
 		if (!ctx.cwd) return;
 
-		const cwdHash = crypto.createHash("md5").update(ctx.cwd).digest("hex");
-		const runtimeDir = process.env.XDG_RUNTIME_DIR ?? "/tmp";
+		const runtimeDir = process.env.XDG_RUNTIME_DIR ?? os.tmpdir();
 		const socketsDir = path.join(runtimeDir, "omp-nvim-sockets");
 
-		if (!fs.existsSync(socketsDir)) {
-			fs.mkdirSync(socketsDir, { recursive: true, mode: 0o700 });
-		} else {
-			fs.chmodSync(socketsDir, 0o700);
-		}
+		fs.mkdirSync(socketsDir, { recursive: true, mode: 0o700 });
+		fs.chmodSync(socketsDir, 0o700);
 
-		socketPath = path.join(socketsDir, `${cwdHash}-${process.pid}.sock`);
-		infoPath = `${socketPath}.info`;
+		const sockPath = path.join(socketsDir, `${process.pid}.sock`);
+		const infPath = `${sockPath}.info`;
+		socketPath = sockPath;
+		infoPath = infPath;
 
-		// Probe each socket file; connection refused = orphaned process (PID check avoids
-		// false-positives from PID reuse but process.kill does not — socket probe does)
+		// Probe each socket; connection refused = orphaned process (probe is more
+		// reliable than process.kill — handles PID reuse transparently)
 		const staleProbes = fs
 			.readdirSync(socketsDir)
 			.filter((f) => f.endsWith(".sock"))
@@ -76,15 +87,16 @@ export default function (pi: ExtensionAPI) {
 			);
 		await Promise.all(staleProbes);
 
-		// Clean up exact match if it somehow exists
-		if (socketPath) {
-			try {
-				fs.unlinkSync(socketPath);
-			} catch {}
-		}
+		// Unconditionally remove our own socket path before listen.
+		// The probe above only unlinks paths it cannot connect to; if a prior
+		// process with the same PID left a live-looking socket (PID reuse race),
+		// the probe leaves it intact and listen would fail with EADDRINUSE.
+		try {
+			fs.unlinkSync(sockPath);
+		} catch {}
+
 		server = net.createServer((socket) => {
 			let buffer = "";
-			const MAX_BUFFER_SIZE = 4 * 1024; // 4KB — paths are ~200 bytes
 			socket.setEncoding("utf8");
 			socket.on("data", (data: string) => {
 				buffer += data;
@@ -111,25 +123,26 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 					} catch {
-						// Ignore parse errors
+						// ignore parse errors
 					}
 				}
 			});
 
 			socket.on("error", () => {});
 		});
-		server.on("error", () => {});
 
-		server.listen(socketPath, () => {
-			if (!infoPath) return;
-			fs.writeFileSync(
-				infoPath,
-				JSON.stringify({ cwd: ctx.cwd, pid: process.pid }),
-			);
+		server.on("error", (err) => {
+			pi.logger.error("[omp.nvim] socket server error", {
+				message: err.message,
+			});
+		});
+
+		server.listen(sockPath, () => {
+			fs.writeFileSync(infPath, JSON.stringify({ cwd: ctx.cwd }));
 		});
 	});
 
-	pi.on("context", async (event) => {
+	pi.on("context", (event) => {
 		if (activeFile) {
 			const safeFile = activeFile.replace(/[<>\n]/g, "");
 			event.messages.push({
@@ -161,10 +174,12 @@ function cleanup() {
 		try {
 			fs.unlinkSync(socketPath);
 		} catch {}
+		socketPath = null;
 	}
 	if (infoPath) {
 		try {
 			fs.unlinkSync(infoPath);
 		} catch {}
+		infoPath = null;
 	}
 }

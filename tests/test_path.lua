@@ -17,11 +17,27 @@ assert_eq("", omp._get_display_path("nofile", "nofile", 1, 1, "n"), "Should igno
 assert_eq("", omp._get_display_path("", "", 10, 10, "n"), "Should ignore empty buffer names")
 
 -- Test: Formats normal mode correctly
-assert_eq("src/main.lua:42", omp._get_display_path("src/main.lua", "", 42, 42, "n"), "Should format single line in normal mode")
+assert_eq(
+  "src/main.lua:42",
+  omp._get_display_path("src/main.lua", "", 42, 42, "n"),
+  "Should format single line in normal mode"
+)
 
 -- Test: Formats visual mode ranges
-assert_eq("src/main.lua:40-45", omp._get_display_path("src/main.lua", "", 45, 40, "v"), "Should format visual selection bottom-up")
-assert_eq("src/main.lua:40-45", omp._get_display_path("src/main.lua", "", 40, 45, "v"), "Should format visual selection top-down")
-assert_eq("src/main.lua:40-45", omp._get_display_path("src/main.lua", "", 45, 40, "V"), "Should format line visual selection")
+assert_eq(
+  "src/main.lua:40-45",
+  omp._get_display_path("src/main.lua", "", 45, 40, "v"),
+  "Should format visual selection bottom-up"
+)
+assert_eq(
+  "src/main.lua:40-45",
+  omp._get_display_path("src/main.lua", "", 40, 45, "v"),
+  "Should format visual selection top-down"
+)
+assert_eq(
+  "src/main.lua:40-45",
+  omp._get_display_path("src/main.lua", "", 45, 40, "V"),
+  "Should format line visual selection"
+)
 
 print("PASS: All tests passed!")
