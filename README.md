@@ -58,9 +58,7 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
 
 ## Agent Behavior
 
-This plugin injects your active file path into the chat as passive background context. The
-injected directive already instructs the AI not to acknowledge or ask about it unless you
-reference it directly (e.g. "this file", "here") — no extra setup required.
+This plugin injects your active file path into the chat as passive background context — no extra setup required.
 
 If you want to further tune how your agent handles this (or any other injected context), you
 can add your own rule to `~/.omp/agent/AGENTS.md`, but it's optional.
