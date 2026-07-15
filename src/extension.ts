@@ -145,17 +145,31 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", (event) => {
 		if (activeFile) {
 			const safeFile = activeFile.replace(/[<>\n]/g, "");
-			event.messages.push({
-				role: "user",
-				content: [
-					{
-						type: "text",
-						text: `<system-directive>\nActive file: ${safeFile}\n</system-directive>`,
-					},
-				],
-				timestamp: Date.now(),
-			});
-			return { messages: event.messages };
+			const directive = `\n\n<system-directive>\nActive file: ${safeFile}\n</system-directive>`;
+			const msgs = event.messages as Array<{
+				role: string;
+				content: string | Array<{ type: string; text?: string }>;
+				timestamp?: number;
+			}>;
+			const lastUserMsg = msgs
+				.slice()
+				.reverse()
+				.find((m) => m.role === "user");
+
+			if (lastUserMsg) {
+				if (Array.isArray(lastUserMsg.content)) {
+					lastUserMsg.content.push({ type: "text", text: directive });
+				} else if (typeof lastUserMsg.content === "string") {
+					lastUserMsg.content += directive;
+				}
+			} else {
+				msgs.push({
+					role: "user",
+					content: [{ type: "text", text: directive.trim() }],
+					timestamp: Date.now(),
+				});
+			}
+			return { messages: msgs };
 		}
 		return undefined;
 	});
