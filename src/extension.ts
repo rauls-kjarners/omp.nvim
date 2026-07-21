@@ -45,6 +45,69 @@ let socketPath: string | null = null;
 let infoPath: string | null = null;
 let activeCtx: PiContext | null = null;
 
+function handleSocketMessage(msg: unknown, ctx: PiContext) {
+	if (
+		msg &&
+		typeof msg === "object" &&
+		"type" in msg &&
+		msg.type === "active_file"
+	) {
+		if ("path" in msg && typeof msg.path === "string" && msg.path) {
+			activeFile = msg.path;
+			ctx.ui.setWidget("nvim-active-file", [msg.path, "⠀"], {
+				placement: "aboveEditor",
+			});
+		} else {
+			activeFile = null;
+			ctx.ui.setWidget("nvim-active-file", undefined);
+		}
+	}
+}
+
+function processSocketBuffer(buffer: string, ctx: PiContext): string {
+	while (true) {
+		const newlineIndex = buffer.indexOf("\n");
+		if (newlineIndex === -1) break;
+		const line = buffer.slice(0, newlineIndex);
+		buffer = buffer.slice(newlineIndex + 1);
+		try {
+			handleSocketMessage(JSON.parse(line), ctx);
+		} catch {
+			// ignore parse errors
+		}
+	}
+	return buffer;
+}
+
+type Message = {
+	role: string;
+	content: string | Array<{ type: string; text?: string }>;
+	timestamp?: number;
+};
+
+function injectContextDirective(msgs: Message[], file: string) {
+	const safeFile = file.replace(/[<>\n]/g, "");
+	const directive = `\n\n<system-directive>\nActive file: ${safeFile}\n</system-directive>`;
+	const lastUserMsg = msgs
+		.slice()
+		.reverse()
+		.find((m) => m.role === "user");
+
+	if (lastUserMsg) {
+		if (Array.isArray(lastUserMsg.content)) {
+			lastUserMsg.content.push({ type: "text", text: directive });
+		} else if (typeof lastUserMsg.content === "string") {
+			lastUserMsg.content += directive;
+		}
+	} else {
+		msgs.push({
+			role: "user",
+			content: [{ type: "text", text: directive.trim() }],
+			timestamp: Date.now(),
+		});
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (server) cleanup();
@@ -106,28 +169,7 @@ export default function (pi: ExtensionAPI) {
 					socket.destroy();
 					return;
 				}
-				while (true) {
-					const newlineIndex = buffer.indexOf("\n");
-					if (newlineIndex === -1) break;
-					const line = buffer.slice(0, newlineIndex);
-					buffer = buffer.slice(newlineIndex + 1);
-					try {
-						const msg = JSON.parse(line);
-						if (msg && typeof msg === "object" && msg.type === "active_file") {
-							if (typeof msg.path === "string" && msg.path) {
-								activeFile = msg.path;
-								ctx.ui.setWidget("nvim-active-file", [msg.path, "⠀"], {
-									placement: "aboveEditor",
-								});
-							} else {
-								activeFile = null;
-								ctx.ui.setWidget("nvim-active-file", undefined);
-							}
-						}
-					} catch {
-						// ignore parse errors
-					}
-				}
+				buffer = processSocketBuffer(buffer, ctx);
 			});
 
 			socket.on("error", () => {});
@@ -152,35 +194,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("context", (event) => {
-		if (activeFile) {
-			const safeFile = activeFile.replace(/[<>\n]/g, "");
-			const directive = `\n\n<system-directive>\nActive file: ${safeFile}\n</system-directive>`;
-			const msgs = event.messages as Array<{
-				role: string;
-				content: string | Array<{ type: string; text?: string }>;
-				timestamp?: number;
-			}>;
-			const lastUserMsg = msgs
-				.slice()
-				.reverse()
-				.find((m) => m.role === "user");
-
-			if (lastUserMsg) {
-				if (Array.isArray(lastUserMsg.content)) {
-					lastUserMsg.content.push({ type: "text", text: directive });
-				} else if (typeof lastUserMsg.content === "string") {
-					lastUserMsg.content += directive;
-				}
-			} else {
-				msgs.push({
-					role: "user",
-					content: [{ type: "text", text: directive.trim() }],
-					timestamp: Date.now(),
-				});
-			}
-			return { messages: msgs };
-		}
-		return undefined;
+		if (!activeFile) return undefined;
+		const msgs = event.messages as Message[];
+		injectContextDirective(msgs, activeFile);
+		return { messages: msgs };
 	});
 
 	pi.on("session_shutdown", cleanup);

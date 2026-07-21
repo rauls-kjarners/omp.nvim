@@ -36,12 +36,49 @@ local active_relative_path = ""
 -- crashed OMP processes — on every keystroke.
 local scanned_mtimes = {}
 
+local function safe_close(pipe)
+  pcall(function()
+    pipe:close()
+  end)
+end
+
+local function connect_socket(socket_path, info_path)
+  active_sockets[socket_path] = true
+  local pipe = uv.new_pipe(false)
+  if not pipe then
+    active_sockets[socket_path] = nil
+    return
+  end
+
+  pipe:connect(socket_path, function(err)
+    if err then
+      active_sockets[socket_path] = nil
+      if err ~= "ECONNREFUSED" and err ~= "ENOENT" then
+        scanned_mtimes[info_path] = nil
+      end
+      return
+    end
+
+    active_sockets[socket_path] = pipe
+    if active_relative_path ~= "" then
+      local msg = vim.json.encode({ type = "active_file", path = active_relative_path }) .. "\n"
+      pipe:write(msg, function(we)
+        if we then
+          safe_close(pipe)
+          active_sockets[socket_path] = nil
+        end
+      end)
+    end
+  end)
+end
+
 local function check_and_add_socket(info_path)
   local st = uv.fs_stat(info_path)
   if not st then
     scanned_mtimes[info_path] = nil
     return
   end
+
   local mtime_key = st.mtime.sec .. ":" .. st.mtime.nsec
   if scanned_mtimes[info_path] == mtime_key then
     return
@@ -49,52 +86,23 @@ local function check_and_add_socket(info_path)
   scanned_mtimes[info_path] = mtime_key
 
   local info = read_info_file(info_path)
-  if info and info.cwd then
-    local cwd = vim.fn.getcwd()
-    local real_cwd = uv.fs_realpath(cwd) or cwd
-    local real_info_cwd = uv.fs_realpath(info.cwd) or info.cwd
-    if real_info_cwd == real_cwd then
-      local socket_path = info_path:gsub("%.info$", "")
-      if not active_sockets[socket_path] then
-        -- Set true as a connecting placeholder so we don't double-connect on
-        -- re-entry. Upgraded to the live pipe handle once the connect succeeds.
-        active_sockets[socket_path] = true
-        local pipe = uv.new_pipe(false)
-        if pipe then
-          pipe:connect(socket_path, function(err)
-            if err then
-              active_sockets[socket_path] = nil
-              -- A live server we briefly failed to reach should not be ignored
-              -- forever, so drop the mtime cache to retry on the next scan.
-              -- But ECONNREFUSED/ENOENT means the socket is dead (crash leftover
-              -- or gone) — keep the cache so we don't retry-storm it every event.
-              if err ~= "ECONNREFUSED" and err ~= "ENOENT" then
-                scanned_mtimes[info_path] = nil
-              end
-              return
-            end
-            -- Persistent pipe is ready. Upgrade placeholder → handle.
-            active_sockets[socket_path] = pipe
-            -- Immediately push the current active file to this new OMP session
-            -- so context is available without waiting for the next vim event.
-            if active_relative_path ~= "" then
-              local msg = vim.json.encode({ type = "active_file", path = active_relative_path }) .. "\n"
-              pipe:write(msg, function(we)
-                if we then
-                  pcall(function()
-                    pipe:close()
-                  end)
-                  active_sockets[socket_path] = nil
-                end
-              end)
-            end
-          end)
-        else
-          active_sockets[socket_path] = nil
-        end
-      end
-    end
+  if not info or not info.cwd then
+    return
   end
+
+  local cwd = vim.fn.getcwd()
+  local real_cwd = uv.fs_realpath(cwd) or cwd
+  local real_info_cwd = uv.fs_realpath(info.cwd) or info.cwd
+  if real_info_cwd ~= real_cwd then
+    return
+  end
+
+  local socket_path = info_path:gsub("%.info$", "")
+  if active_sockets[socket_path] then
+    return
+  end
+
+  connect_socket(socket_path, info_path)
 end
 
 local function sync_sockets()
@@ -123,9 +131,7 @@ local function sync_sockets()
       local sock_path = cached_path:gsub("%.info$", "")
       local pipe = active_sockets[sock_path]
       if pipe and pipe ~= true then
-        pcall(function()
-          pipe:close()
-        end)
+        safe_close(pipe)
       end
       active_sockets[sock_path] = nil
     end
@@ -139,9 +145,7 @@ local function broadcast_active_file(path)
     if pipe ~= true then -- skip connecting placeholders; only write to live pipes
       pipe:write(msg, function(err)
         if err then
-          pcall(function()
-            pipe:close()
-          end)
+          safe_close(pipe)
           active_sockets[socket_path] = nil
         end
       end)
@@ -210,11 +214,6 @@ function M.setup()
     end
   end
 
-  local function get_relative_active_path()
-    update_active_path()
-    return active_relative_path
-  end
-
   -- Capture the active file immediately so OMP receives context the moment it boots
   update_active_path()
   local last_broadcast_path = nil
@@ -223,7 +222,8 @@ function M.setup()
     -- reporting filenames in the watcher callback, so OMP sessions started after
     -- Neovim are discovered here rather than being silently missed.
     sync_sockets()
-    local path = get_relative_active_path()
+    update_active_path()
+    local path = active_relative_path
     if path ~= "" and path ~= last_broadcast_path then
       last_broadcast_path = path
       broadcast_active_file(path)
@@ -243,7 +243,8 @@ function M.setup()
       if filename and filename:match("%.info$") then
         vim.defer_fn(function()
           check_and_add_socket(sockets_dir .. "/" .. filename)
-          local path = get_relative_active_path()
+          update_active_path()
+          local path = active_relative_path
           if path ~= "" then
             broadcast_active_file(path)
           end
@@ -252,7 +253,8 @@ function M.setup()
         -- macOS FSEvents: filename is nil or directory — full rescan
         vim.defer_fn(function()
           sync_sockets()
-          local path = get_relative_active_path()
+          update_active_path()
+          local path = active_relative_path
           if path ~= "" then
             broadcast_active_file(path)
           end

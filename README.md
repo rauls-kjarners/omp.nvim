@@ -34,7 +34,7 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
    return {
      {
        "rauls-kjarners/omp.nvim",
-       lazy = false,
+       event = "VeryLazy",
        config = function()
          require("omp").setup()
        end,
