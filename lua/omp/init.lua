@@ -16,8 +16,18 @@ local function read_info_file(path)
   return nil
 end
 
+-- path -> true (connecting placeholder) or uv_pipe handle (connected).
+-- Tests observe this table to verify cwd-matched sockets are discovered.
 local active_sockets = {}
-local sockets_dir = (os.getenv("XDG_RUNTIME_DIR") or uv.os_tmpdir()) .. "/omp-nvim-sockets"
+local raw_sockets_dir = (os.getenv("XDG_RUNTIME_DIR") or uv.os_tmpdir()) .. "/omp-nvim-sockets"
+-- Resolved to the real path (no symlinks) in M.setup() after mkdir, so the
+-- FSEvents watcher fires correctly on macOS where os.tmpdir() returns a path
+-- under /var which is a symlink to /private/var.
+local sockets_dir = raw_sockets_dir
+
+-- Module-level so connect callbacks (which are async) can read the current
+-- value without needing a closure into M.setup().
+local active_relative_path = ""
 
 -- .info files are written once at listen() and never modified, so once a file's
 -- mtime has been parsed we can skip re-reading it. Without this, sync_sockets()
@@ -45,7 +55,44 @@ local function check_and_add_socket(info_path)
     local real_info_cwd = uv.fs_realpath(info.cwd) or info.cwd
     if real_info_cwd == real_cwd then
       local socket_path = info_path:gsub("%.info$", "")
-      active_sockets[socket_path] = true
+      if not active_sockets[socket_path] then
+        -- Set true as a connecting placeholder so we don't double-connect on
+        -- re-entry. Upgraded to the live pipe handle once the connect succeeds.
+        active_sockets[socket_path] = true
+        local pipe = uv.new_pipe(false)
+        if pipe then
+          pipe:connect(socket_path, function(err)
+            if err then
+              active_sockets[socket_path] = nil
+              -- A live server we briefly failed to reach should not be ignored
+              -- forever, so drop the mtime cache to retry on the next scan.
+              -- But ECONNREFUSED/ENOENT means the socket is dead (crash leftover
+              -- or gone) — keep the cache so we don't retry-storm it every event.
+              if err ~= "ECONNREFUSED" and err ~= "ENOENT" then
+                scanned_mtimes[info_path] = nil
+              end
+              return
+            end
+            -- Persistent pipe is ready. Upgrade placeholder → handle.
+            active_sockets[socket_path] = pipe
+            -- Immediately push the current active file to this new OMP session
+            -- so context is available without waiting for the next vim event.
+            if active_relative_path ~= "" then
+              local msg = vim.json.encode({ type = "active_file", path = active_relative_path }) .. "\n"
+              pipe:write(msg, function(we)
+                if we then
+                  pcall(function()
+                    pipe:close()
+                  end)
+                  active_sockets[socket_path] = nil
+                end
+              end)
+            end
+          end)
+        else
+          active_sockets[socket_path] = nil
+        end
+      end
     end
   end
 end
@@ -68,10 +115,19 @@ local function sync_sockets()
     end
   end
   -- Prune cache entries for .info files that no longer exist, so the map
-  -- doesn't grow unbounded across repeated OMP crashes/restarts.
+  -- doesn't grow unbounded across repeated OMP crashes/restarts. Also close
+  -- any persistent pipe whose OMP process has gone away.
   for cached_path in pairs(scanned_mtimes) do
     if not seen[cached_path] then
       scanned_mtimes[cached_path] = nil
+      local sock_path = cached_path:gsub("%.info$", "")
+      local pipe = active_sockets[sock_path]
+      if pipe and pipe ~= true then
+        pcall(function()
+          pipe:close()
+        end)
+      end
+      active_sockets[sock_path] = nil
     end
   end
 end
@@ -79,20 +135,14 @@ end
 local function broadcast_active_file(path)
   local msg = vim.json.encode({ type = "active_file", path = path }) .. "\n"
 
-  for socket_path, _ in pairs(active_sockets) do
-    local pipe = uv.new_pipe(false)
-    if pipe then
-      pipe:connect(socket_path, function(err)
-        if not err then
-          pipe:write(msg, function(write_err)
-            if write_err then
-              active_sockets[socket_path] = nil
-            end
+  for socket_path, pipe in pairs(active_sockets) do
+    if pipe ~= true then -- skip connecting placeholders; only write to live pipes
+      pipe:write(msg, function(err)
+        if err then
+          pcall(function()
             pipe:close()
           end)
-        else
           active_sockets[socket_path] = nil
-          pipe:close()
         end
       end)
     end
@@ -129,7 +179,12 @@ M._sockets_dir = sockets_dir
 local active_watcher = nil
 
 function M.setup()
-  uv.fs_mkdir(sockets_dir, 448, function() end) -- 0o700: match TS side
+  -- Synchronous mkdir so fs_realpath below sees the directory. The async form
+  -- (with callback) returns immediately, making the realpath call race against
+  -- the not-yet-created directory on the very first run.
+  pcall(uv.fs_mkdir, raw_sockets_dir, 448) -- ignore EEXIST; 0o700 matches TS side
+  sockets_dir = uv.fs_realpath(raw_sockets_dir) or raw_sockets_dir
+  M._sockets_dir = sockets_dir -- refresh seam with realpath-resolved dir
   sync_sockets()
 
   -- Guard against repeated setup(): stop the previous watcher to prevent leaks
@@ -140,7 +195,6 @@ function M.setup()
   end
 
   local group = vim.api.nvim_create_augroup("OmpNvimGroup", { clear = true })
-  local active_relative_path = ""
 
   local function update_active_path()
     local buf = vim.api.nvim_get_current_buf()
@@ -163,7 +217,6 @@ function M.setup()
 
   -- Capture the active file immediately so OMP receives context the moment it boots
   update_active_path()
-
   local last_broadcast_path = nil
   local function handle_buf_change()
     -- Rescan on every change (cheap scandir). Fixes macOS FSEvents not always
@@ -183,7 +236,7 @@ function M.setup()
   local watcher = uv.new_fs_event()
   if watcher then
     active_watcher = watcher
-    watcher:start(sockets_dir, {}, function(err, filename, _events)
+    watcher:start(sockets_dir, {}, function(err, filename, _)
       if err then
         return
       end
@@ -211,6 +264,24 @@ function M.setup()
   vim.api.nvim_create_autocmd({ "BufEnter", "BufWritePost", "CursorHold", "CursorHoldI", "CursorMoved" }, {
     group = group,
     callback = handle_buf_change,
+  })
+
+  vim.api.nvim_create_autocmd({ "VimLeavePre" }, {
+    group = group,
+    callback = function()
+      -- Close all persistent pipes. The OS closes FDs on exit anyway, but
+      -- explicit close lets OMP detect the disconnect before process teardown,
+      -- which is more reliable than sending a message (async delivery not
+      -- guaranteed during shutdown).
+      for socket_path, pipe in pairs(active_sockets) do
+        active_sockets[socket_path] = nil
+        if pipe ~= true then
+          pcall(function()
+            pipe:close()
+          end)
+        end
+      end
+    end,
   })
 end
 

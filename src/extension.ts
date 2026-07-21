@@ -43,11 +43,13 @@ let activeFile: string | null = null;
 let server: net.Server | null = null;
 let socketPath: string | null = null;
 let infoPath: string | null = null;
+let activeCtx: PiContext | null = null;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (server) cleanup();
 		if (!ctx.cwd) return;
+		activeCtx = ctx;
 
 		const runtimeDir = process.env.XDG_RUNTIME_DIR ?? os.tmpdir();
 		const socketsDir = path.join(runtimeDir, "omp-nvim-sockets");
@@ -129,6 +131,13 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			socket.on("error", () => {});
+
+			socket.on("close", () => {
+				// Nvim's persistent pipe closed (clean exit or crash). Clear the widget
+				// so stale context is not injected into the next message.
+				activeFile = null;
+				ctx.ui.setWidget("nvim-active-file", undefined);
+			});
 		});
 
 		server.on("error", (err) => {
@@ -180,6 +189,9 @@ export default function (pi: ExtensionAPI) {
 }
 
 function cleanup() {
+	activeFile = null;
+	activeCtx?.ui.setWidget("nvim-active-file", undefined);
+	activeCtx = null;
 	if (server) {
 		server.close();
 		server = null;

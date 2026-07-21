@@ -33,7 +33,7 @@ jobs:
           version: stable
 
       - name: Install stylua
-        uses: JohnnyMorganz/stylua-action@v4
+        uses: JohnnyMorganz/stylua-action@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           version: latest
