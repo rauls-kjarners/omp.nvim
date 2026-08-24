@@ -30,16 +30,25 @@ local sockets_dir = raw_sockets_dir
 local active_relative_path = ""
 
 -- .info files are written once at listen() and never modified, so once a file's
--- mtime has been parsed we can skip re-reading it. Without this, sync_sockets()
--- running on every CursorMoved (see handle_buf_change) would re-parse JSON and
--- re-run fs_realpath for every .info file — including dead ones left behind by
--- crashed OMP processes — on every keystroke.
+-- mtime has been parsed we can skip re-reading it. Without this, every
+-- sync_sockets() (BufEnter/BufWritePost/CursorHold/CursorHoldI, plus the
+-- fs_event watcher) would re-parse JSON and re-run fs_realpath for every .info
+-- file — including dead ones left behind by crashed OMP processes.
 local scanned_mtimes = {}
 
-local function safe_close(pipe)
-  pcall(function()
-    pipe:close()
-  end)
+-- Drop a socket from the live set and invalidate its mtime cache entry, so the
+-- next sync_sockets() re-reads the .info file and reconnects. Without the cache
+-- invalidation check_and_add_socket() returns early on the unchanged mtime and
+-- the OMP session stays unreachable until it restarts — the widget then shows
+-- nothing for the rest of the Neovim session.
+local function drop_socket(socket_path, pipe)
+  if pipe and pipe ~= true then
+    pcall(function()
+      pipe:close()
+    end)
+  end
+  active_sockets[socket_path] = nil
+  scanned_mtimes[socket_path .. ".info"] = nil
 end
 
 local function connect_socket(socket_path, info_path)
@@ -64,8 +73,7 @@ local function connect_socket(socket_path, info_path)
       local msg = vim.json.encode({ type = "active_file", path = active_relative_path }) .. "\n"
       pipe:write(msg, function(we)
         if we then
-          safe_close(pipe)
-          active_sockets[socket_path] = nil
+          drop_socket(socket_path, pipe)
         end
       end)
     end
@@ -127,13 +135,8 @@ local function sync_sockets()
   -- any persistent pipe whose OMP process has gone away.
   for cached_path in pairs(scanned_mtimes) do
     if not seen[cached_path] then
-      scanned_mtimes[cached_path] = nil
       local sock_path = cached_path:gsub("%.info$", "")
-      local pipe = active_sockets[sock_path]
-      if pipe and pipe ~= true then
-        safe_close(pipe)
-      end
-      active_sockets[sock_path] = nil
+      drop_socket(sock_path, active_sockets[sock_path])
     end
   end
 end
@@ -145,8 +148,7 @@ local function broadcast_active_file(path)
     if pipe ~= true then -- skip connecting placeholders; only write to live pipes
       pipe:write(msg, function(err)
         if err then
-          safe_close(pipe)
-          active_sockets[socket_path] = nil
+          drop_socket(socket_path, pipe)
         end
       end)
     end
@@ -217,17 +219,24 @@ function M.setup()
   -- Capture the active file immediately so OMP receives context the moment it boots
   update_active_path()
   local last_broadcast_path = nil
-  local function handle_buf_change()
-    -- Rescan on every change (cheap scandir). Fixes macOS FSEvents not always
-    -- reporting filenames in the watcher callback, so OMP sessions started after
-    -- Neovim are discovered here rather than being silently missed.
-    sync_sockets()
+  -- Cheap path: cursor/selection moved, so only the line numbers in the widget
+  -- payload changed. No socket rescan here — CursorMoved fires per keystroke and
+  -- fs_scandir + fs_stat per .info file on every one is pure syscall churn.
+  local function broadcast_if_changed()
     update_active_path()
     local path = active_relative_path
     if path ~= "" and path ~= last_broadcast_path then
       last_broadcast_path = path
       broadcast_active_file(path)
     end
+  end
+
+  -- Sync path: buffer/idle events, where an OMP session may have booted since
+  -- the last scan. Backstop for the fs_event watcher (macOS FSEvents does not
+  -- reliably report the filename), not the primary discovery mechanism.
+  local function handle_buf_change()
+    sync_sockets()
+    broadcast_if_changed()
   end
 
   -- fs_event watcher: fast-path for Linux (inotify delivers filename reliably).
@@ -263,9 +272,14 @@ function M.setup()
     end)
   end
 
-  vim.api.nvim_create_autocmd({ "BufEnter", "BufWritePost", "CursorHold", "CursorHoldI", "CursorMoved" }, {
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWritePost", "CursorHold", "CursorHoldI" }, {
     group = group,
     callback = handle_buf_change,
+  })
+
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    group = group,
+    callback = broadcast_if_changed,
   })
 
   vim.api.nvim_create_autocmd({ "VimLeavePre" }, {

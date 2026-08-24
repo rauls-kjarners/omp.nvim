@@ -40,12 +40,16 @@ interface ExtensionAPI {
 const MAX_BUFFER_SIZE = 4 * 1024; // 4KB — paths are ~200 bytes
 
 let activeFile: string | null = null;
+// Socket that last delivered activeFile. Only its close may clear the widget:
+// any OMP session's stale-socket probe (and any other stray connect) opens and
+// immediately closes a connection, which must not wipe a live Nvim's context.
+let activeSource: unknown = null;
 let server: net.Server | null = null;
 let socketPath: string | null = null;
 let infoPath: string | null = null;
 let activeCtx: PiContext | null = null;
 
-function handleSocketMessage(msg: unknown, ctx: PiContext) {
+function handleSocketMessage(msg: unknown, ctx: PiContext, source: unknown) {
 	if (
 		msg &&
 		typeof msg === "object" &&
@@ -54,24 +58,33 @@ function handleSocketMessage(msg: unknown, ctx: PiContext) {
 	) {
 		if ("path" in msg && typeof msg.path === "string" && msg.path) {
 			activeFile = msg.path;
+			activeSource = source;
 			ctx.ui.setWidget("nvim-active-file", [msg.path, "⠀"], {
 				placement: "aboveEditor",
 			});
 		} else {
+			// Same ownership rule as the close handler: a socket that is not the
+			// current owner may not clear another live client's context.
+			if (activeSource !== null && activeSource !== source) return;
 			activeFile = null;
+			activeSource = null;
 			ctx.ui.setWidget("nvim-active-file", undefined);
 		}
 	}
 }
 
-function processSocketBuffer(buffer: string, ctx: PiContext): string {
+function processSocketBuffer(
+	buffer: string,
+	ctx: PiContext,
+	source: unknown,
+): string {
 	while (true) {
 		const newlineIndex = buffer.indexOf("\n");
 		if (newlineIndex === -1) break;
 		const line = buffer.slice(0, newlineIndex);
 		buffer = buffer.slice(newlineIndex + 1);
 		try {
-			handleSocketMessage(JSON.parse(line), ctx);
+			handleSocketMessage(JSON.parse(line), ctx, source);
 		} catch {
 			// ignore parse errors
 		}
@@ -139,13 +152,20 @@ export default function (pi: ExtensionAPI) {
 							probe.destroy();
 							resolve();
 						});
-						probe.on("error", () => {
-							try {
-								fs.unlinkSync(sockFile);
-							} catch {}
-							try {
-								fs.unlinkSync(`${sockFile}.info`);
-							} catch {}
+						probe.on("error", (err: NodeJS.ErrnoException) => {
+							// Only ECONNREFUSED/ENOENT mean the socket is actually dead (no
+							// listener, or the file vanished). Any other error (e.g. a
+							// transient failure while the peer is mid-accept) must NOT
+							// delete a live peer's files out from under it — that peer
+							// would then be undiscoverable until it restarts.
+							if (err.code === "ECONNREFUSED" || err.code === "ENOENT") {
+								try {
+									fs.unlinkSync(sockFile);
+								} catch {}
+								try {
+									fs.unlinkSync(`${sockFile}.info`);
+								} catch {}
+							}
 							resolve();
 						});
 					}),
@@ -169,15 +189,19 @@ export default function (pi: ExtensionAPI) {
 					socket.destroy();
 					return;
 				}
-				buffer = processSocketBuffer(buffer, ctx);
+				buffer = processSocketBuffer(buffer, ctx, socket);
 			});
 
 			socket.on("error", () => {});
 
 			socket.on("close", () => {
-				// Nvim's persistent pipe closed (clean exit or crash). Clear the widget
-				// so stale context is not injected into the next message.
+				// Only the pipe that owns the current activeFile may clear it. Probes
+				// from other OMP sessions connect+destroy against this same server;
+				// clearing on those would blank a live Nvim's context permanently
+				// (Nvim dedupes broadcasts, so it never re-sends an unchanged path).
+				if (activeSource !== socket) return;
 				activeFile = null;
+				activeSource = null;
 				ctx.ui.setWidget("nvim-active-file", undefined);
 			});
 		});
@@ -207,6 +231,7 @@ export default function (pi: ExtensionAPI) {
 
 function cleanup() {
 	activeFile = null;
+	activeSource = null;
 	activeCtx?.ui.setWidget("nvim-active-file", undefined);
 	activeCtx = null;
 	if (server) {
