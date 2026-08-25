@@ -26,6 +26,9 @@ jobs:
       - name: Run Typecheck and Lint
         run: npm run check
 
+      - name: Run Extension Tests
+        run: node tests/test_extension_ownership.ts
+
       - name: Setup Neovim
         uses: rhysd/action-setup-vim@v1
         with:
@@ -51,3 +54,6 @@ jobs:
         run: |
           nvim --headless --cmd "set rtp+=." -l tests/test_path.lua
           nvim --headless --cmd "set rtp+=." -l tests/test_socket_matching.lua
+          nvim --headless --cmd "set rtp+=." -l tests/test_watcher.lua
+          nvim --headless --cmd "set rtp+=." -l tests/test_pipe_liveness.lua
+          nvim --headless --cmd "set rtp+=." -l tests/test_birthtime_probe.lua

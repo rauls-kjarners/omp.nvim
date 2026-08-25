@@ -55,16 +55,54 @@ function M.check()
     vim.health.info("Sockets directory not yet created (will be on next setup()): " .. sockets_dir)
   end
 
-  -- Active OMP sessions
-  local active = omp._active_sockets
-  local count = 0
-  for _ in pairs(active) do
-    count = count + 1
+  -- fs_event watcher: primary discovery path. Without it, sessions started
+  -- while Neovim sits idle are only found on the next buffer/idle event.
+  if type(omp._watcher_active) ~= "function" then
+    vim.health.warn("omp module predates watcher diagnostics; restart Neovim after updating")
+  elseif omp._watcher_active() then
+    vim.health.ok("Socket directory watcher running")
+  else
+    vim.health.warn(
+      "Socket directory watcher not running — new OMP sessions are only discovered "
+        .. "on BufEnter/BufWritePost/CursorHold, not immediately"
+    )
   end
-  if count > 0 then
-    vim.health.ok(count .. " active OMP session(s) connected in this directory")
+
+  -- Active OMP sessions. A pipe whose files are gone is still usable (macOS
+  -- deletes $TMPDIR entries older than 3 days under the running server), but it
+  -- means no new session can be discovered until OMP re-creates them.
+  local connected, connecting, orphaned = 0, 0, {}
+  for socket_path, pipe in pairs(omp._active_sockets) do
+    if pipe == true then
+      connecting = connecting + 1
+    else
+      connected = connected + 1
+      if not vim.uv.fs_stat(socket_path) then
+        table.insert(orphaned, socket_path)
+      end
+    end
+  end
+
+  if connected > 0 then
+    vim.health.ok(connected .. " active OMP session(s) connected in this directory")
   else
     vim.health.info("No active OMP sessions detected (start OMP in this project directory)")
+  end
+  if connecting > 0 then
+    vim.health.info(connecting .. " connection(s) still in progress")
+  end
+  for _, socket_path in ipairs(orphaned) do
+    vim.health.warn("Connected but socket file is gone (reaped or unlinked): " .. socket_path)
+  end
+
+  -- What Neovim believes it has published. If OMP shows no active file while
+  -- this reports a path, the break is on the extension side, not here.
+  if type(omp._broadcast_state) ~= "function" then
+    vim.health.warn("omp module predates broadcast diagnostics; restart Neovim after updating")
+  else
+    local current, broadcast = omp._broadcast_state()
+    vim.health.info("Current buffer: " .. (current ~= "" and current or "(none)"))
+    vim.health.info("Last broadcast: " .. (broadcast or "(never)"))
   end
 end
 

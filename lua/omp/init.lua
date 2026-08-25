@@ -47,8 +47,14 @@ local function drop_socket(socket_path, pipe)
       pipe:close()
     end)
   end
-  active_sockets[socket_path] = nil
-  scanned_mtimes[socket_path .. ".info"] = nil
+  -- Identity check. read_start EOF and a queued write callback are two async
+  -- drop triggers for the same pipe: if EOF dropped it and the next scan
+  -- already reconnected, the late write error must not evict the fresh pipe
+  -- (which would then be leaked open and never written to).
+  if active_sockets[socket_path] == pipe then
+    active_sockets[socket_path] = nil
+    scanned_mtimes[socket_path .. ".info"] = nil
+  end
 end
 
 local function connect_socket(socket_path, info_path)
@@ -69,6 +75,15 @@ local function connect_socket(socket_path, info_path)
     end
 
     active_sockets[socket_path] = pipe
+    -- EOF detection. OMP never writes to us, so this callback only fires when
+    -- the peer goes away (err, or a nil chunk = EOF). Without it a dead
+    -- session lingers in active_sockets until the next write fails, which may
+    -- never come if the user stops moving the cursor.
+    pipe:read_start(function(rerr, data)
+      if rerr or not data then
+        drop_socket(socket_path, pipe)
+      end
+    end)
     if active_relative_path ~= "" then
       local msg = vim.json.encode({ type = "active_file", path = active_relative_path }) .. "\n"
       pipe:write(msg, function(we)
@@ -113,9 +128,116 @@ local function check_and_add_socket(info_path)
   connect_socket(socket_path, info_path)
 end
 
+-- Resolve the sockets directory through symlinks (macOS $TMPDIR lives under
+-- /var, a symlink to /private/var, and FSEvents only fires on the real path).
+-- Re-run on every scan: an intermediate component can be retargeted, and a
+-- realpath that failed while the directory was missing must not stick — once
+-- the directory exists again the recreate branch below never runs, so nothing
+-- else would ever fix the cached spelling.
+local function resolve_sockets_dir()
+  sockets_dir = uv.fs_realpath(raw_sockets_dir) or raw_sockets_dir
+  M._sockets_dir = sockets_dir -- refresh seam with realpath-resolved dir
+end
+
+-- Whether uv.fs_stat()'s birthtime is a real creation time on this filesystem.
+-- libuv only gets one from statx(); where statx is unavailable — kernels
+-- < 4.11, or a seccomp filter that rejects it, after which libuv latches
+-- no_statx for the whole process — uv__to_stat() aliases birthtime to ctime
+-- (libuv src/unix/fs.c), and a directory's ctime advances every time an entry
+-- is created or removed inside it. Folding that into the fingerprint below
+-- would rebind the watcher on every .info file an OMP session writes. nil
+-- until measured.
+local birthtime_reliable = nil
+
+-- Measure it on the directory we are about to watch instead of guessing from a
+-- table of filesystems: create and remove one probe entry and see what moved.
+--   birthtime moved with ctime          -> aliased to ctime, unusable
+--   birthtime still equal to ctime      -> ctime granularity too coarse to
+--                                          tell the two apart; assume unusable
+--   birthtime held while ctime advanced -> a real creation time
+-- A filesystem that reports no birthtime at all (tmpfs leaves it 0) lands in
+-- the last case and contributes a constant 0 — harmless, and those filesystems
+-- allocate inode numbers from a counter and never reuse them, so dev+ino
+-- already identifies the directory there.
+local function probe_birthtime(dir)
+  local before = uv.fs_stat(dir)
+  if not before then
+    return -- gone; ensure_sockets_dir() retries after the next mkdir
+  end
+  -- No .info suffix, so sync_sockets() ignores it and on_fs_event() treats it
+  -- as an unnamed change: at most one extra rescan, and only on macOS, where
+  -- FSEvents watches the path rather than the inode and can still see a
+  -- directory this call recreated. Bounded either way — measured once per
+  -- session.
+  local probe = dir .. "/.omp-birthtime-probe"
+  local fd = uv.fs_open(probe, "w", 384) -- 0o600
+  if not fd then
+    return -- not writable; stay unmeasured rather than guess
+  end
+  uv.fs_close(fd)
+  uv.fs_unlink(probe)
+  local after = uv.fs_stat(dir)
+  if not after then
+    return
+  end
+  local was, now, ctime = before.birthtime or {}, after.birthtime or {}, after.ctime or {}
+  birthtime_reliable = was.sec == now.sec
+    and was.nsec == now.nsec
+    and not (now.sec == ctime.sec and now.nsec == ctime.nsec)
+end
+
+-- mkdir -p (macOS can reap the whole $TMPDIR subtree, so the parent may be
+-- gone too) plus a fresh realpath. Synchronous: the async form returns before
+-- the directory exists, racing the realpath.
+local function ensure_sockets_dir()
+  pcall(vim.fn.mkdir, raw_sockets_dir, "p", 448) -- 0o700 matches the TS side
+  resolve_sockets_dir()
+  -- Once per session, and only against a directory that exists and is ours to
+  -- write to; a failed probe leaves it unmeasured and is retried here.
+  if birthtime_reliable == nil then
+    probe_birthtime(sockets_dir)
+  end
+end
+
+-- Identity of the directory the live watcher is bound to. dev+ino is not
+-- enough: ext4 hands the just-freed inode number straight back to the next
+-- mkdir at the same path, so a delete+recreate is invisible in ino alone (this
+-- is why the check passed on macOS and failed on Linux CI). birthtime closes it
+-- wherever the filesystem reports a usable one; where it does not, dev+ino is
+-- the only identity available and a same-path recreate is caught only by the
+-- missing-directory branch of sync_sockets().
+local function dir_fingerprint(st)
+  if not st then
+    return nil
+  end
+  if not birthtime_reliable then
+    return ("%d:%d"):format(st.dev, st.ino)
+  end
+  local birth = st.birthtime or {}
+  return ("%d:%d:%d.%d"):format(st.dev, st.ino, birth.sec or 0, birth.nsec or 0)
+end
+
+-- Fingerprint of what the watcher actually bound; see the rebind check in
+-- sync_sockets().
+local watched_dir = nil
+
+-- Forward declaration: sync_sockets() rebinds the watcher when the sockets
+-- directory has been recreated, and the watcher callback calls sync_sockets().
+local ensure_watcher
+
 local function sync_sockets()
+  -- Re-resolve before scanning: every key in active_sockets and scanned_mtimes
+  -- is derived from this string, so the scan below and the watcher must agree
+  -- on it.
+  resolve_sockets_dir()
   local req = uv.fs_scandir(sockets_dir)
   if not req then
+    -- Directory itself is gone (macOS reaps $TMPDIR contents every night).
+    -- Recreate it so the next OMP session has somewhere to bind, and rebind the
+    -- watcher: the old handle is still attached to the deleted inode and will
+    -- never fire again.
+    ensure_sockets_dir()
+    ensure_watcher(true)
     return
   end
   local seen = {}
@@ -130,15 +252,32 @@ local function sync_sockets()
       check_and_add_socket(info_path)
     end
   end
-  -- Prune cache entries for .info files that no longer exist, so the map
-  -- doesn't grow unbounded across repeated OMP crashes/restarts. Also close
-  -- any persistent pipe whose OMP process has gone away.
+  -- Forget cache entries whose .info file is gone, so the map doesn't grow
+  -- unbounded across OMP crashes/restarts and so a returning session is
+  -- re-read. A missing .info does NOT mean the peer died: macOS deletes
+  -- $TMPDIR files older than 3 days even while the server is listening on
+  -- them. The pipe is the source of truth — keep it until a write actually
+  -- fails, which drop_socket handles.
   for cached_path in pairs(scanned_mtimes) do
     if not seen[cached_path] then
-      local sock_path = cached_path:gsub("%.info$", "")
-      drop_socket(sock_path, active_sockets[sock_path])
+      scanned_mtimes[cached_path] = nil
     end
   end
+  -- Rebind when the directory on disk is no longer the one we bound: a
+  -- delete+recreate at the same path (the reaper, then OMP recreating it)
+  -- leaves an inode-bound inotify watch dead on Linux while the handle still
+  -- looks live, so _watcher_active() would report running while discovery has
+  -- silently degraded to buffer/idle polling. Otherwise just re-arm a watcher
+  -- that failed to start earlier; no-op while one is live. The reaper can
+  -- delete the directory between our mkdir and fs_event start (start then
+  -- returns nil+ENOENT and nothing is bound), and the OMP extension recreates
+  -- the directory itself afterwards.
+  local fingerprint = dir_fingerprint(uv.fs_stat(sockets_dir))
+  -- A live watcher with no fingerprint means the stat right after the bind lost
+  -- the race with the reaper: we cannot tell which inode the handle is attached
+  -- to, so rebind rather than keep a watch that may be dead while
+  -- _watcher_active() reports healthy.
+  ensure_watcher(fingerprint ~= nil and (watched_dir == nil or fingerprint ~= watched_dir))
 end
 
 local function broadcast_active_file(path)
@@ -177,100 +316,146 @@ function M._get_display_path(bufname, buftype, line, v_line, mode)
   return display_str
 end
 
--- Test seams (prefixed with _ to signal internal use)
+local active_watcher = nil
+local last_broadcast_path = nil
+
+local function update_active_path()
+  local buf = vim.api.nvim_get_current_buf()
+  local buftype = vim.api.nvim_get_option_value("buftype", { buf = buf })
+  local bufname = vim.api.nvim_buf_get_name(buf)
+  local line = vim.fn.line(".")
+  local v_line = vim.fn.line("v")
+  local mode = vim.fn.mode()
+
+  local display_str = M._get_display_path(bufname, buftype, line, v_line, mode)
+  if display_str ~= "" then
+    active_relative_path = display_str
+  end
+end
+
+-- Cheap path: cursor/selection moved, so only the line numbers in the widget
+-- payload changed. No socket rescan here — CursorMoved fires per keystroke and
+-- fs_scandir + fs_stat per .info file on every one is pure syscall churn.
+local function broadcast_if_changed()
+  update_active_path()
+  local path = active_relative_path
+  if path ~= "" and path ~= last_broadcast_path then
+    last_broadcast_path = path
+    broadcast_active_file(path)
+  end
+end
+
+-- Sync path: buffer/idle events, where an OMP session may have booted since the
+-- last scan. Backstop for the fs_event watcher (macOS FSEvents does not
+-- reliably report the filename), not the primary discovery mechanism.
+local function handle_buf_change()
+  sync_sockets()
+  broadcast_if_changed()
+end
+
+local function on_fs_event(err, filename, _)
+  if err then
+    return
+  end
+  vim.defer_fn(function()
+    if filename and filename:match("%.info$") then
+      check_and_add_socket(sockets_dir .. "/" .. filename)
+    else
+      -- macOS FSEvents: filename is nil or the directory itself — full rescan
+      sync_sockets()
+    end
+    update_active_path()
+    if active_relative_path ~= "" then
+      -- Unconditional: a newly discovered session has never seen our path, so
+      -- the broadcast_if_changed() dedupe must not suppress it. Record it after
+      -- the fact so the dedupe and _broadcast_state() stay accurate.
+      last_broadcast_path = active_relative_path
+      broadcast_active_file(active_relative_path)
+    end
+  end, 100)
+end
+
+-- Assigns the forward-declared local; `local function` here would shadow it.
+ensure_watcher = function(rebind)
+  if active_watcher then
+    if not rebind then
+      return
+    end
+    pcall(function()
+      active_watcher:stop()
+    end)
+    pcall(function()
+      active_watcher:close()
+    end)
+    active_watcher = nil
+    watched_dir = nil
+  end
+
+  local watcher = uv.new_fs_event()
+  if not watcher then
+    return
+  end
+  -- luv returns nil plus an error string here (e.g. ENOENT when the directory
+  -- does not exist); it does not raise. Checking only pcall would store a
+  -- handle that never fires, and checkhealth would report a running watcher.
+  local ok, ret = pcall(watcher.start, watcher, sockets_dir, {}, on_fs_event)
+  if ok and ret == 0 then
+    active_watcher = watcher
+    -- Fingerprint of what we actually bound, so sync_sockets() can spot a
+    -- delete+recreate at the same path.
+    watched_dir = dir_fingerprint(uv.fs_stat(sockets_dir))
+  else
+    watched_dir = nil
+    pcall(function()
+      watcher:close()
+    end)
+  end
+end
+
+-- Test/health seams (prefixed with _ to signal internal use). The watcher and
+-- path are read through functions because they are reassigned at runtime.
 M._active_sockets = active_sockets
 M._check_and_add_socket = check_and_add_socket
+M._drop_socket = drop_socket
 M._sockets_dir = sockets_dir
 
-local active_watcher = nil
+function M._watcher_active()
+  return active_watcher ~= nil
+end
+
+-- Fingerprint of the directory the live watcher is bound to, or nil. Lets tests
+-- prove a rebind happened after a delete+recreate at the same path, which is
+-- otherwise invisible: the handle stays non-nil either way.
+function M._watched_dir()
+  return watched_dir
+end
+
+-- Whether birthtime is part of the fingerprint on this filesystem, or nil while
+-- unmeasured. Lets tests skip the reused-inode-number case, which is
+-- undetectable from stat alone without a usable birthtime.
+function M._birthtime_reliable()
+  return birthtime_reliable
+end
+
+function M._broadcast_state()
+  return active_relative_path, last_broadcast_path
+end
 
 function M.setup()
-  -- Synchronous mkdir so fs_realpath below sees the directory. The async form
-  -- (with callback) returns immediately, making the realpath call race against
-  -- the not-yet-created directory on the very first run.
-  pcall(uv.fs_mkdir, raw_sockets_dir, 448) -- ignore EEXIST; 0o700 matches TS side
-  sockets_dir = uv.fs_realpath(raw_sockets_dir) or raw_sockets_dir
-  M._sockets_dir = sockets_dir -- refresh seam with realpath-resolved dir
+  ensure_sockets_dir()
+  -- Module-scoped, so a repeated setup() would otherwise inherit the old dedupe
+  -- value and suppress the first broadcast after a reload.
+  last_broadcast_path = nil
+  -- Rebind before the first scan: sync_sockets() ends in ensure_watcher(false),
+  -- which would otherwise bind a handle this call immediately stops and
+  -- replaces (two uv_fs_event allocations per setup()).
+  ensure_watcher(true)
   sync_sockets()
-
-  -- Guard against repeated setup(): stop the previous watcher to prevent leaks
-  if active_watcher then
-    active_watcher:stop()
-    active_watcher:close()
-    active_watcher = nil
-  end
 
   local group = vim.api.nvim_create_augroup("OmpNvimGroup", { clear = true })
 
-  local function update_active_path()
-    local buf = vim.api.nvim_get_current_buf()
-    local buftype = vim.api.nvim_get_option_value("buftype", { buf = buf })
-    local bufname = vim.api.nvim_buf_get_name(buf)
-    local line = vim.fn.line(".")
-    local v_line = vim.fn.line("v")
-    local mode = vim.fn.mode()
-
-    local display_str = M._get_display_path(bufname, buftype, line, v_line, mode)
-    if display_str ~= "" then
-      active_relative_path = display_str
-    end
-  end
-
   -- Capture the active file immediately so OMP receives context the moment it boots
   update_active_path()
-  local last_broadcast_path = nil
-  -- Cheap path: cursor/selection moved, so only the line numbers in the widget
-  -- payload changed. No socket rescan here — CursorMoved fires per keystroke and
-  -- fs_scandir + fs_stat per .info file on every one is pure syscall churn.
-  local function broadcast_if_changed()
-    update_active_path()
-    local path = active_relative_path
-    if path ~= "" and path ~= last_broadcast_path then
-      last_broadcast_path = path
-      broadcast_active_file(path)
-    end
-  end
-
-  -- Sync path: buffer/idle events, where an OMP session may have booted since
-  -- the last scan. Backstop for the fs_event watcher (macOS FSEvents does not
-  -- reliably report the filename), not the primary discovery mechanism.
-  local function handle_buf_change()
-    sync_sockets()
-    broadcast_if_changed()
-  end
-
-  -- fs_event watcher: fast-path for Linux (inotify delivers filename reliably).
-  -- On macOS (FSEvents) filename may be nil or the directory name — fall back to
-  -- a full sync_sockets() in that case so newly booted OMP sessions are found.
-  local watcher = uv.new_fs_event()
-  if watcher then
-    active_watcher = watcher
-    watcher:start(sockets_dir, {}, function(err, filename, _)
-      if err then
-        return
-      end
-      if filename and filename:match("%.info$") then
-        vim.defer_fn(function()
-          check_and_add_socket(sockets_dir .. "/" .. filename)
-          update_active_path()
-          local path = active_relative_path
-          if path ~= "" then
-            broadcast_active_file(path)
-          end
-        end, 100)
-      else
-        -- macOS FSEvents: filename is nil or directory — full rescan
-        vim.defer_fn(function()
-          sync_sockets()
-          update_active_path()
-          local path = active_relative_path
-          if path ~= "" then
-            broadcast_active_file(path)
-          end
-        end, 100)
-      end
-    end)
-  end
 
   vim.api.nvim_create_autocmd({ "BufEnter", "BufWritePost", "CursorHold", "CursorHoldI" }, {
     group = group,

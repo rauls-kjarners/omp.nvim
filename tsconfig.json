@@ -4,7 +4,6 @@
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
 		"noEmit": true,
-		"rootDir": "./src",
 		"strict": true,
 		"esModuleInterop": true,
 		"skipLibCheck": true,
@@ -18,5 +17,7 @@
 		"noUncheckedIndexedAccess": true,
 		"types": ["node"]
 	},
-	"include": ["src/**/*"]
+	// rootDir is omitted deliberately: noEmit makes it meaningless, and it would
+	// reject tests/ living outside src/.
+	"include": ["src/**/*", "tests/**/*.ts"]
 }
