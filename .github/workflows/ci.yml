@@ -26,9 +26,6 @@ jobs:
       - name: Run Typecheck and Lint
         run: npm run check
 
-      - name: Run Extension Tests
-        run: node tests/test_extension_ownership.ts
-
       - name: Setup Neovim
         uses: rhysd/action-setup-vim@v1
         with:
@@ -51,9 +48,77 @@ jobs:
         run: luacheck lua/ tests/
 
       - name: Run Lua Tests
+        # Globbed, not listed: a hand-maintained list silently never runs a new
+        # tests/*.lua file. Each file gets its own Neovim, which the suites that
+        # latch module state at load time require.
         run: |
-          nvim --headless --cmd "set rtp+=." -l tests/test_path.lua
-          nvim --headless --cmd "set rtp+=." -l tests/test_socket_matching.lua
-          nvim --headless --cmd "set rtp+=." -l tests/test_watcher.lua
-          nvim --headless --cmd "set rtp+=." -l tests/test_pipe_liveness.lua
-          nvim --headless --cmd "set rtp+=." -l tests/test_birthtime_probe.lua
+          status=0
+          for f in tests/*.lua; do
+            echo "== $f"
+            nvim --headless --cmd "set rtp+=." -l "$f" || status=1
+          done
+          exit $status
+
+  # The README advertises a minimum host version. Without this job that claim
+  # decays silently: nothing stops a commit from reaching for an API that only
+  # exists in a later release. Floor and current pin both run the socket suite.
+  extension:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        host: ["18.2.1", "^18.2.11"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pin host to ${{ matrix.host }}
+        run: npm install --no-save "@oh-my-pi/pi-coding-agent@${{ matrix.host }}"
+
+      # Read the manifest off disk: `npm ls` exits 1 when the installed version
+      # sits outside the package.json range, which is exactly what the floor leg
+      # does, and `require()` cannot reach it past the host's exports map.
+      # Asserted, not printed: a print step cannot fail, so a floor leg that
+      # silently resolved to the current release would report green while
+      # testing nothing it claims to test.
+      - name: Assert resolved host version
+        env:
+          SPEC: ${{ matrix.host }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const spec = process.env.SPEC;
+            const manifest = "node_modules/@oh-my-pi/pi-coding-agent/package.json";
+            const version = JSON.parse(fs.readFileSync(manifest, "utf8")).version;
+            const parts = (v) => v.split(".").map(Number);
+            let ok;
+            if (spec.startsWith("^")) {
+              const [major, minor, patch] = parts(spec.slice(1));
+              const [x, y, z] = parts(version);
+              ok = x === major && (y > minor || (y === minor && z >= patch));
+            } else {
+              ok = version === spec;
+            }
+            console.log(`resolved ${version} for ${spec}`);
+            if (!ok) {
+              console.log(`::error::host resolved to ${version}, which does not satisfy ${spec}`);
+              process.exit(1);
+            }
+          '
+
+      - name: Typecheck against host
+        run: npm run typecheck
+
+      - name: Run Extension Tests
+        run: node tests/test_extension_ownership.ts

@@ -1,6 +1,6 @@
 {
 	"name": "omp.nvim",
-	"version": "1.1.7",
+	"version": "2.0.0",
 	"description": "Oh My Pi Neovim Integration",
 	"author": "Oh My Pi Community",
 	"license": "MIT",
@@ -36,12 +36,13 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.1",
-		"@oh-my-pi/pi-coding-agent": "^16.2.9",
+		"@oh-my-pi/pi-coding-agent": "^18.2.11",
+		"@types/bun": "^1.4.2",
 		"@types/node": "^24.13.2",
 		"oh-my-pi": "latest",
 		"typescript": "^6.0.3"
 	},
-	"pi": {
+	"omp": {
 		"extensions": [
 			"./src/extension.ts"
 		]

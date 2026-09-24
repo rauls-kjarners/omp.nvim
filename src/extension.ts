@@ -2,51 +2,27 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type {
+	ContextEvent,
+	ContextEventResult,
+	ExtensionAPI,
+	ExtensionContext,
+} from "@oh-my-pi/pi-coding-agent";
 
-interface PiLogger {
-	error(message: string, context?: Record<string, unknown>): void;
-	warn(message: string, context?: Record<string, unknown>): void;
-	info(message: string, context?: Record<string, unknown>): void;
-	debug(message: string, context?: Record<string, unknown>): void;
-}
-
-interface PiContext {
-	cwd: string;
-	// Session identity. Compared by reference only: the host builds a fresh ctx
-	// object literal for every event emit, so ctx identity says nothing across
-	// events, while the SessionManager behind it lives as long as the session
-	// and differs per subagent. Optional so a host without it still loads.
-	sessionManager?: unknown;
-	ui: {
-		setWidget(
-			key: string,
-			content: string[] | undefined,
-			options?: { placement?: "aboveEditor" | "belowEditor" },
-		): void;
-	};
-}
-
-interface ExtensionAPI {
-	logger: PiLogger;
-	on(
-		event: "session_start",
-		handler: (_event: unknown, ctx: PiContext) => void | Promise<void>,
-	): void;
-	on(
-		event: "context",
-		handler: (event: { messages: unknown[] }) => unknown,
-	): void;
-	on(
-		event: "session_shutdown",
-		handler: (_event: unknown, ctx: PiContext) => void | Promise<void>,
-	): void;
-}
+type ManagedTimer = Timer;
+type ContextMessage = ContextEvent["messages"][number];
 
 const MAX_BUFFER_SIZE = 4 * 1024; // 4KB — paths are ~200 bytes
-// Re-listen attempts are rate limited: if listen() keeps failing (EACCES on a
-// tmpdir we cannot recreate, a racing peer on the same path), the socket file
-// never appears and every subsequent user message would retry and log again.
-const HEAL_COOLDOWN_MS = 30_000;
+// macOS reaps per-user $TMPDIR contents: com.apple.bsd.dirhelper runs at boot
+// and daily at 03:35 with CLEAN_FILES_OLDER_THAN_DAYS=3, and connecting to a
+// unix socket never updates its atime — so a busy, healthy socket looks
+// untouched and gets deleted out from under the listening server. Existing
+// pipes keep working, but the session becomes undiscoverable: no new Nvim can
+// connect, and Nvim's own rescan can no longer see the .info file. A timer, not
+// a per-message check: an idle session is exactly the one that gets reaped, and
+// it emits no events to heal on. The period also rate-limits a failing listen()
+// (EACCES on a tmpdir we cannot recreate, a racing peer on the same path).
+const HEAL_INTERVAL_MS = 15_000;
 
 interface SharedState {
 	activeFile: string | null;
@@ -57,29 +33,33 @@ interface SharedState {
 	server: net.Server | null;
 	socketPath: string | null;
 	infoPath: string | null;
-	// Context of the owning session, used for widget updates and self-heal.
-	activeCtx: PiContext | null;
-	// SessionManager of the owning session (see PiContext.sessionManager), or null
-	// when nothing has claimed the socket yet. Every AgentSession in the process
-	// — including each subagent — gets session_start and, on dispose,
-	// session_shutdown. Without this ownership check a finishing subagent ran
-	// cleanup() and deleted the interactive session's socket, killing the widget
-	// and context injection for the rest of the process.
+	// Context of the owning session, used for widget updates and timer teardown.
+	activeCtx: ExtensionContext | null;
+	// SessionManager of the owning session, or null while unclaimed. Compared by
+	// reference, never by id: the host re-mints session ids on /new, resume and
+	// /tree, while the manager object lives as long as the session and differs
+	// per subagent. Every AgentSession in the process — including each subagent —
+	// gets session_start and, on dispose, session_shutdown; without this check a
+	// finishing subagent ran cleanup() and deleted the interactive session's
+	// socket, killing the widget and context injection for the rest of the
+	// process.
 	owner: unknown;
-	// Set once a session has claimed the socket. Distinct from `owner`, which is
-	// UNIDENTIFIED on a host that exposes no session identity: without a separate
-	// flag, "no owner key" and "no owner" collapse and every later session —
-	// subagents included — passes the ownership check again.
-	claimed: boolean;
-	// ExtensionAPI of the owning session. The self-heal runs from whichever
-	// session emitted `context`, and a rebuilt server must not bake a disposed
-	// subagent's logger into its long-lived handlers.
-	pi: ExtensionAPI | null;
 	// Accepted client pipes. server.close() only stops the listener, so without
 	// destroying these the peer never sees EOF: Nvim keeps a dead pipe (and a
 	// stale widget path) for the rest of its session.
 	clients: Set<net.Socket>;
-	lastHealMs: number;
+	healTimer: ManagedTimer | null;
+	// True while the socket files are known missing. The heal retries every tick
+	// — recovery is the point — but a permanently failing one (read-only runtime
+	// dir, a racing peer holding our path) would otherwise log on every tick for
+	// the life of the session, so the outage is announced once and its end is
+	// announced once.
+	healing: boolean;
+	// Last failure reported by reportFailure(), as `label\nmessage`. Repeats are
+	// dropped; a *different* failure is not, so an outage whose cause changes
+	// (EACCES that becomes EADDRINUSE once the directory is writable again)
+	// still names its current blocker instead of the stale first one.
+	lastFailure: string | null;
 	exitHookInstalled: boolean;
 }
 
@@ -101,10 +81,10 @@ function sharedState(): SharedState {
 		infoPath: null,
 		activeCtx: null,
 		owner: null,
-		claimed: false,
-		pi: null,
 		clients: new Set(),
-		lastHealMs: 0,
+		healTimer: null,
+		healing: false,
+		lastFailure: null,
 		exitHookInstalled: false,
 	};
 	realm[STATE_KEY] = fresh;
@@ -113,31 +93,11 @@ function sharedState(): SharedState {
 
 const state = sharedState();
 
-// Sentinel owner key for a host that exposes no session identity, so "claimed
-// but unattributable" never compares equal to any ctx.
-const UNIDENTIFIED = Symbol.for("omp.nvim.no-session-identity");
-
-// Set on the module copy that claimed the socket. The host imports this module
-// once per session, so copy identity substitutes for session identity when the
-// ctx has none. Not on SharedState: it is deliberately per copy.
-let claimedHere = false;
-
-function ownerKeyOf(ctx: PiContext): unknown {
-	return ctx.sessionManager ?? UNIDENTIFIED;
-}
-
-function isOwnerSession(ctx: PiContext): boolean {
-	// Unclaimed: first session in wins.
-	if (!state.claimed) return true;
-	// Claimed, but the host gave us no session identity: fall back to the module
-	// copy. Everyone else is denied — the process exit hook and the stale-socket
-	// probe still reclaim the files, so refusing a teardown is strictly safer
-	// than unlinking a live session's socket.
-	if (state.owner === UNIDENTIFIED) return claimedHere;
-	return ownerKeyOf(ctx) === state.owner;
-}
-
-function handleSocketMessage(msg: unknown, ctx: PiContext, source: unknown) {
+function handleSocketMessage(
+	msg: unknown,
+	ctx: ExtensionContext,
+	source: unknown,
+) {
 	if (
 		msg &&
 		typeof msg === "object" &&
@@ -163,7 +123,7 @@ function handleSocketMessage(msg: unknown, ctx: PiContext, source: unknown) {
 
 function processSocketBuffer(
 	buffer: string,
-	ctx: PiContext,
+	ctx: ExtensionContext,
 	source: unknown,
 ): string {
 	while (true) {
@@ -180,43 +140,60 @@ function processSocketBuffer(
 	return buffer;
 }
 
-type Message = {
-	role: string;
-	content: string | Array<{ type: string; text?: string }>;
-	timestamp?: number;
-};
-
-function injectContextDirective(msgs: Message[], file: string) {
+// Appended as its own per-call message rather than merged into the last user
+// message: `context` messages are a per-request deep copy, and editing the tail
+// of persisted history moves the provider's prompt-cache breakpoints, while an
+// appended message keeps them rolling (OMP 18.2.1, can1357/oh-my-pi#11897).
+function activeFileMessage(file: string): ContextMessage {
 	const safeFile = file.replace(/[<>\n]/g, "");
-	const directive = `\n\n<system-directive>\nActive file: ${safeFile}\n</system-directive>`;
-	const lastUserMsg = msgs
-		.slice()
-		.reverse()
-		.find((m) => m.role === "user");
-
-	if (lastUserMsg) {
-		if (Array.isArray(lastUserMsg.content)) {
-			lastUserMsg.content.push({ type: "text", text: directive });
-		} else if (typeof lastUserMsg.content === "string") {
-			lastUserMsg.content += directive;
-		}
-	} else {
-		msgs.push({
-			role: "user",
-			content: [{ type: "text", text: directive.trim() }],
-			timestamp: Date.now(),
-		});
-	}
+	return {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `<system-directive>\nActive file: ${safeFile}\n</system-directive>`,
+			},
+		],
+		// Marks it host-injected rather than typed by the user, so the TUI and
+		// attribution accounting do not treat it as a real prompt.
+		synthetic: true,
+		timestamp: Date.now(),
+	};
 }
 
-function startServer(pi: ExtensionAPI, ctx: PiContext) {
+// Deduped by content, not by a flag captured when the attempt started: the
+// handlers below outlive the call that installs them (a listen error arrives
+// asynchronously, and the server that finally binds keeps its handler for the
+// rest of the session), so a captured "already reported" boolean would mute a
+// later, different failure forever. A permanent failure is retried every heal
+// tick, and an error per tick is ~5.7k/day routed to the extension error
+// channel; the errno is the whole diagnostic, so novelty is the gate.
+function reportFailure(pi: ExtensionAPI, label: string, message: string) {
+	const failure = `${label}\n${message}`;
+	if (state.lastFailure === failure) return;
+	state.lastFailure = failure;
+	pi.logger.error(`[omp.nvim] ${label}`, { message });
+}
+
+// The socket files are in place again. Reports the recovery exactly once, so an
+// operator who saw the outage line sees it close instead of guessing.
+function markHealthy(pi: ExtensionAPI) {
+	state.lastFailure = null;
+	if (!state.healing) return;
+	state.healing = false;
+	pi.logger.info("[omp.nvim] socket restored", {
+		socketPath: state.socketPath,
+	});
+}
+
+function startServer(pi: ExtensionAPI, ctx: ExtensionContext) {
 	const sockPath = state.socketPath;
 	const infPath = state.infoPath;
 	if (!sockPath || !infPath) return;
 	// Never overwrite a live server: session_start suspends across the stale
-	// probe phase, and a context event in that window can heal and bind first.
-	// Dropping the reference would leave that server listening on an orphaned
-	// inode, with its handlers and fd retained and unreachable by cleanup().
+	// probe phase, and a heal tick in that window can bind first. Dropping the
+	// reference would leave that server listening on an orphaned inode, with its
+	// handlers and fd retained and unreachable by cleanup().
 	if (state.server) {
 		state.server.close();
 		state.server = null;
@@ -226,11 +203,11 @@ function startServer(pi: ExtensionAPI, ctx: PiContext) {
 		fs.mkdirSync(path.dirname(sockPath), { recursive: true, mode: 0o700 });
 		fs.chmodSync(path.dirname(sockPath), 0o700);
 	} catch (err) {
-		// Called from the context hook too, where a throw would fail the user's
-		// message. Without the directory there is nothing to bind; bail quietly.
-		pi.logger.error("[omp.nvim] cannot prepare sockets directory", {
-			message: (err as Error).message,
-		});
+		reportFailure(
+			pi,
+			"cannot prepare sockets directory",
+			(err as Error).message,
+		);
 		return;
 	}
 	// Unconditionally remove our own socket path before listen. Stale-socket
@@ -272,50 +249,45 @@ function startServer(pi: ExtensionAPI, ctx: PiContext) {
 	});
 
 	srv.on("error", (err) => {
-		pi.logger.error("[omp.nvim] socket server error", {
-			message: err.message,
-		});
+		reportFailure(pi, "socket server error", err.message);
 		// A failed listen() leaves a server object with a null handle. Drop it so
 		// state.server keeps meaning "a server we may be listening on"; the next
-		// context event then rebuilds it instead of finding a corpse.
+		// heal tick then rebuilds it instead of finding a corpse.
 		if (srv === state.server && !srv.listening) state.server = null;
 	});
 
 	srv.listen(sockPath, () => {
 		try {
 			fs.writeFileSync(infPath, JSON.stringify({ cwd: ctx.cwd }));
+			// Marked here, not on a later tick that observes both files: a reaper
+			// can delete them again before the next tick runs, and an outage that
+			// was never marked over would silence its own report.
+			markHealthy(pi);
 		} catch (err) {
 			// The reaper can delete the directory between mkdir and this callback.
-			// Stay listening: existing pipes keep working and the next context
-			// event re-runs ensureListening().
-			pi.logger.error("[omp.nvim] cannot write socket info file", {
-				message: (err as Error).message,
-			});
+			// Stay listening: existing pipes keep working and the next heal tick
+			// re-runs ensureListening().
+			reportFailure(
+				pi,
+				"cannot write socket info file",
+				(err as Error).message,
+			);
 		}
 	});
 	state.server = srv;
 }
 
-// macOS reaps per-user $TMPDIR contents: com.apple.bsd.dirhelper runs at boot
-// and daily at 03:35 with CLEAN_FILES_OLDER_THAN_DAYS=3, and connecting to a
-// unix socket never updates its atime — so a busy, healthy socket looks
-// untouched and gets deleted out from under the listening server. Existing
-// pipes keep working, but the session becomes undiscoverable: no new Nvim can
-// connect, and Nvim's own rescan can no longer see the .info file. Re-assert
-// both paths instead of relying on a timer.
-function ensureListening(pi: ExtensionAPI, ctx: PiContext) {
+function ensureListening(pi: ExtensionAPI, ctx: ExtensionContext) {
 	if (!state.socketPath || !state.infoPath) return;
-	if (fs.existsSync(state.socketPath) && fs.existsSync(state.infoPath)) return;
+	if (fs.existsSync(state.socketPath) && fs.existsSync(state.infoPath)) {
+		markHealthy(pi);
+		return;
+	}
 
-	const now = Date.now();
-	if (now - state.lastHealMs < HEAL_COOLDOWN_MS) return;
 	// Socket intact and we are still bound to it, only the .info file is gone
 	// (the write in listen() may also have failed). Rewriting it keeps the
 	// listener — and its accepted pipes — alive; closing here would unlink the
-	// healthy socket synchronously and then possibly fail to rebuild it. The
-	// cooldown is deliberately not spent on this path: it exists to rate-limit
-	// failing listen() retries, and burning it on a success would leave the
-	// session undiscoverable for 30s if the file vanishes again immediately.
+	// healthy socket synchronously and then possibly fail to rebuild it.
 	// `listening` and not just a non-null server: a failed listen() leaves a
 	// server object with a null handle in state.server, and rewriting .info for
 	// a socket we do not own would satisfy the guard above forever, so the
@@ -323,14 +295,17 @@ function ensureListening(pi: ExtensionAPI, ctx: PiContext) {
 	if (state.server?.listening && fs.existsSync(state.socketPath)) {
 		try {
 			fs.writeFileSync(state.infoPath, JSON.stringify({ cwd: ctx.cwd }));
+			markHealthy(pi);
 			return;
 		} catch {}
 	}
-	state.lastHealMs = now;
 
-	pi.logger.info("[omp.nvim] socket files vanished, re-listening", {
-		socketPath: state.socketPath,
-	});
+	if (!state.healing) {
+		state.healing = true;
+		pi.logger.info("[omp.nvim] socket files vanished, re-listening", {
+			socketPath: state.socketPath,
+		});
+	}
 	// startServer() closes the previous server itself. Node unlinks a pipe
 	// server's bound path synchronously inside close(), so the old server can
 	// never reap the new socket file.
@@ -340,9 +315,11 @@ function ensureListening(pi: ExtensionAPI, ctx: PiContext) {
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		// One socket per process, owned by the first session that claims it.
-		// Subagent sessions must not rebind it (that would repoint the widget at
-		// a UI-less context) nor tear it down when they finish.
-		if (!isOwnerSession(ctx)) return;
+		// Subagents and headless runs get a UI-less context: binding there would
+		// repoint the widget at a surface the user never sees, and the session
+		// that finishes first would unlink the interactive session's socket.
+		if (!ctx.hasUI) return;
+		if (state.owner !== null && state.owner !== ctx.sessionManager) return;
 		if (state.server) cleanup();
 		if (!ctx.cwd) return;
 
@@ -365,10 +342,7 @@ export default function (pi: ExtensionAPI) {
 		// block every later session from binding while this one never listens, and
 		// ensureListening() cannot recover it because socketPath is still null.
 		state.activeCtx = ctx;
-		state.owner = ownerKeyOf(ctx);
-		state.claimed = true;
-		claimedHere = true;
-		state.pi = pi;
+		state.owner = ctx.sessionManager;
 
 		const sockPath = path.join(socketsDir, `${process.pid}.sock`);
 		const infPath = `${sockPath}.info`;
@@ -419,24 +393,38 @@ export default function (pi: ExtensionAPI) {
 					}),
 			);
 		await Promise.all(staleProbes);
+		// session_shutdown can land while this handler is suspended above, in
+		// which case cleanup() already ran and the host already dropped this
+		// session's managed timers. Binding past that point would leave a server
+		// and an interval holding a disposed ctx, with nothing left to clear them.
+		if (state.owner !== ctx.sessionManager) return;
 
 		startServer(pi, ctx);
+		// Managed timer, not raw setInterval: a throw from a raw one escapes the
+		// handler dispatch as a process-fatal uncaughtException and takes the
+		// whole session down. This handle is unref'd and cleared on shutdown.
+		// Any previous handle is dropped first: a re-entered session_start (the
+		// same session claiming again after a failed listen(), where
+		// state.server is null and the cleanup() above is skipped) would
+		// otherwise overwrite the field and leave the earlier interval running
+		// with no handle left to clear it.
+		if (state.healTimer !== null) ctx.clearTimer(state.healTimer);
+		state.healTimer = ctx.setInterval(
+			() => ensureListening(pi, ctx),
+			HEAL_INTERVAL_MS,
+		);
 	});
 
-	pi.on("context", (event) => {
-		// Cheap self-heal, once per user message (two stats, no timer). Always with
-		// the owner's ExtensionAPI: a subagent's `context` event must not bake its
-		// soon-disposed logger into the long-lived server's handlers.
-		if (state.activeCtx && state.pi) ensureListening(state.pi, state.activeCtx);
+	pi.on("context", (event: ContextEvent): ContextEventResult | undefined => {
 		if (!state.activeFile) return undefined;
-		const msgs = event.messages as Message[];
-		injectContextDirective(msgs, state.activeFile);
-		return { messages: msgs };
+		return {
+			messages: [...event.messages, activeFileMessage(state.activeFile)],
+		};
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		// Every AgentSession dispose lands here, subagents included.
-		if (!isOwnerSession(ctx)) {
+		if (state.owner !== ctx.sessionManager) {
 			pi.logger.debug("[omp.nvim] ignoring shutdown of non-owner session");
 			return;
 		}
@@ -455,15 +443,14 @@ function cleanup() {
 	state.activeFile = null;
 	state.activeSource = null;
 	state.activeCtx?.ui.setWidget("nvim-active-file", undefined);
+	if (state.healTimer !== null) {
+		state.activeCtx?.clearTimer(state.healTimer);
+		state.healTimer = null;
+	}
+	state.healing = false;
+	state.lastFailure = null;
 	state.activeCtx = null;
 	state.owner = null;
-	state.claimed = false;
-	// Release this copy's local claim too. Without it, on an identity-less host
-	// a copy whose session ended keeps claimedHere = true, so isOwnerSession()
-	// would grant it teardown rights over whichever session claims next.
-	claimedHere = false;
-	state.pi = null;
-	state.lastHealMs = 0;
 	// server.close() only stops the listener. Accepted pipes must be destroyed
 	// so the peer sees EOF — otherwise Nvim keeps a dead pipe (and writes into a
 	// shut-down session) for the rest of its lifetime, since the socket file

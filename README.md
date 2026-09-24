@@ -17,7 +17,7 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
 ## Requirements
 
 - Neovim >= 0.10.0
-- Oh My Pi >= 16.2.9
+- Oh My Pi >= 18.2.1
 
 ## Installation & Setup
 

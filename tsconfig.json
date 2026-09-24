@@ -15,7 +15,7 @@
 		"noImplicitOverride": true,
 		"erasableSyntaxOnly": true,
 		"noUncheckedIndexedAccess": true,
-		"types": ["node"]
+		"types": ["node", "bun"]
 	},
 	// rootDir is omitted deliberately: noEmit makes it meaningless, and it would
 	// reject tests/ living outside src/.
