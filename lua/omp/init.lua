@@ -441,7 +441,16 @@ function M._broadcast_state()
   return active_relative_path, last_broadcast_path
 end
 
-function M.setup()
+function M.attach_terminal(buf)
+  return require("omp.graphics").attach(buf)
+end
+
+function M.terminal_env()
+  return require("omp.graphics").terminal_env()
+end
+
+function M.setup(opts)
+  require("omp.graphics").setup((opts or {}).terminal_graphics)
   ensure_sockets_dir()
   -- Module-scoped, so a repeated setup() would otherwise inherit the old dedupe
   -- value and suppress the first broadcast after a reload.

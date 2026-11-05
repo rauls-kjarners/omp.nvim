@@ -19,6 +19,29 @@ function M.check()
     vim.health.error("vim.uv not available (upgrade to Neovim >= 0.10)")
   end
 
+  local graphics = require("omp.graphics")
+  if graphics.is_enabled() then
+    vim.health.info("OMP terminal graphics relay enabled (Kitty Unicode placeholders, outer TUI required)")
+    local reason = graphics.support_error()
+    if reason then
+      vim.health.warn(reason)
+    end
+    for buf, relay in pairs(graphics.status()) do
+      local message = string.format(
+        "Terminal %d: %d PNG upload(s), %d virtual placement(s), %d rejected request(s)",
+        buf,
+        relay.uploads,
+        relay.placements,
+        relay.rejected
+      )
+      if relay.error then
+        vim.health.error(message .. "; " .. relay.error)
+      else
+        vim.health.ok(message)
+      end
+    end
+  end
+
   -- Sockets directory
   local omp = require("omp")
   local sockets_dir = omp._sockets_dir
