@@ -72,6 +72,35 @@ The project is split into two halves:
 
 Run `:checkhealth omp` inside Neovim to verify the integration is working correctly.
 
+## Optional attachment thumbnails (experimental)
+
+OMP can display attachment thumbnails inside a Neovim terminal by forwarding
+Kitty PNG uploads and virtual placements to the outer terminal. This is opt-in;
+the existing context bridge and its Neovim >= 0.10 requirement are unchanged.
+Graphics require Neovim >= 0.12, a POSIX TUI with LuaJIT, and an outer terminal
+supporting Kitty Unicode placeholders. tmux, screen, Zellij, GUI clients, and
+headless sessions are not supported by this relay.
+
+```lua
+require("omp").setup({ terminal_graphics = { enabled = true } })
+
+-- Example using Snacks; any terminal integration can explicitly attach a buffer.
+local terminal = Snacks.terminal.toggle("omp", {
+  cwd = vim.fn.getcwd(),
+  env = require("omp").terminal_env(),
+  win = { position = "right", width = 0.4 },
+})
+require("omp").attach_terminal(terminal.buf)
+```
+
+Enable this only after verifying the outer terminal supports that graphics mode.
+`terminal_env()` enables OMP's Kitty placeholders on supported host paths and
+disables images when the relay is disabled or the host path is unsupported. It
+does not probe the outer terminal's graphics capabilities. `:checkhealth omp`
+reports unsupported host paths, upload/placement counters, and write failures.
+
+See [terminal graphics](docs/terminal-graphics.md) for limits and validation.
+
 ## Development
 
 The OMP extension is written in TypeScript and runs natively on OMP's Bun engine without requiring compilation. Any changes to `src/extension.ts` will take effect the next time you boot or `/reload` an OMP instance. Changes to `lua/omp/init.lua` take effect when Neovim is restarted.
