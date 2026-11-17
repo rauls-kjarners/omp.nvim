@@ -1,12 +1,5 @@
-// Host simulation for the extension's socket ownership rules.
-//
-// The real host re-imports each extension per session with a cache-busting
-// specifier, mints a fresh ctx object literal for every event emit, and hands
-// session_start/session_shutdown to every AgentSession in the process —
-// subagents included. All three matter: module-scoped state is therefore
-// per-session, ctx identity is meaningless across events, and a subagent's
-// shutdown must not unlink the interactive session's socket.
-//
+// Simulates the host: a module copy per session, a fresh ctx per emit, and
+// session events for every AgentSession, subagents included.
 // Run: node tests/test_extension_ownership.ts
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -20,11 +13,8 @@ const extensionPath = path.join(
 	"src",
 	"extension.ts",
 );
-// Private runtime dir, exported before the first emit: the extension resolves
-// XDG_RUNTIME_DIR ?? os.tmpdir() inside session_start, and CI sets
-// XDG_RUNTIME_DIR (/run/user/1001 on ubuntu-latest), so deriving the expected
-// paths from os.tmpdir() watches a directory nothing ever binds and every wait
-// times out. Also keeps the test off a real OMP session's sockets.
+// Set before the first emit: CI sets XDG_RUNTIME_DIR, which the extension
+// prefers over os.tmpdir().
 const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-nvim-test-"));
 process.env.XDG_RUNTIME_DIR = runtimeDir;
 const sockPath = path.join(
@@ -40,8 +30,6 @@ type Widget = string[] | undefined;
 const widget: { value: Widget } = { value: undefined };
 let loadTag = 0;
 
-// Single cleanup site: covers fail(), the success tail, and an uncaught throw.
-// process.exit() still runs exit handlers, so nothing needs to duplicate this.
 let lockedRoot: string | null = null;
 let noisyRoot: string | null = null;
 process.on("exit", () => {
@@ -49,9 +37,7 @@ process.on("exit", () => {
 		if (!root) continue;
 		try {
 			fs.chmodSync(root, 0o700);
-		} catch {
-			// Already gone or never chmodded; the rmSync below is what matters.
-		}
+		} catch {}
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 	fs.rmSync(runtimeDir, { recursive: true, force: true });
@@ -74,18 +60,13 @@ async function waitFor(predicate: () => boolean, label: string) {
 	fail(`timed out waiting for ${label}`);
 }
 
-// One module instance per session, like loadLegacyPiModule's `?mtime=` tag.
-// Dynamic import is the point of this test: it reproduces the host's per-session
-// module loading, which a static import cannot express.
 const logCounts = { info: 0, warn: 0, error: 0 };
 
 async function loadExtension(): Promise<Map<string, Handler[]>> {
 	const handlers = new Map<string, Handler[]>();
 	const pi = {
 		logger: {
-			// Surfaced, not swallowed: a failed mkdir or listen is otherwise
-			// invisible and the test dies on an unexplained timeout. Counted too,
-			// so the heal's log volume during an outage is assertable.
+			// Printed: a failed mkdir or listen otherwise surfaces only as a timeout.
 			error: (msg: string, meta?: unknown) => {
 				logCounts.error += 1;
 				console.log(`  logger.error: ${msg} ${JSON.stringify(meta ?? {})}`);
@@ -106,29 +87,22 @@ async function loadExtension(): Promise<Map<string, Handler[]>> {
 		},
 	};
 	loadTag += 1;
+	// Cache-busting query: the host loads a module copy per session.
 	const mod = await import(`${extensionPath}?load=${loadTag}`);
 	mod.default(pi);
 	return handlers;
 }
 
-// Stable per session, distinct per subagent, and its session id is re-minted by
-// /new, resume and /tree — hence ownership keys on the object, not the id.
 function makeSessionManager(id: string) {
 	return { id, getSessionId: () => id };
 }
 
-// Managed timers registered through ctx.setInterval. The self-heal runs on one
-// of these, so a test drives it by invoking the callback instead of waiting out
-// the real period. The callback doubles as its own handle, like a Timer.
+// ctx.setInterval callbacks, invoked directly; each is its own handle.
 const healTicks: Array<() => void> = [];
-// Read through a function: comparing `healTicks.length` directly lets the
-// compiler narrow it to the literal one assertion proved, after which the next
-// assertion looks unreachable.
+// A function, so TS doesn't narrow the length to a literal across assertions.
 const timerCount = (): number => healTicks.length;
 
-// Fresh literal per emit, like ExtensionRunner.createContext(). hasUI is false
-// for subagents, print mode and other headless runs — that is what keeps them
-// off the socket.
+// Fresh literal per emit, like ExtensionRunner.createContext().
 function ctxFor(sessionManager: object, hasUI = true) {
 	return {
 		cwd: process.cwd(),
@@ -139,9 +113,7 @@ function ctxFor(sessionManager: object, hasUI = true) {
 				widget.value = content;
 			},
 		},
-		// The period is asserted, not ignored: an omitted `ms` makes the real host
-		// fire on its shortest interval forever, and a test that only counts
-		// registrations would stay green through that.
+		// An omitted period makes the host fire on its shortest interval.
 		setInterval: (callback: () => void, ms?: number) => {
 			if (typeof ms !== "number" || ms < 1_000) {
 				fail(`heal timer registered with an unusable period: ${ms}`);
@@ -166,9 +138,6 @@ async function emit(
 
 console.log("Running OMP extension ownership tests...");
 
-// A UI-less session (subagent, print mode, an RPC host without UI) must not
-// claim the socket: the widget would point at a surface the user never sees,
-// and whichever such session finished first would unlink the socket.
 const headlessHandlers = await loadExtension();
 await emit(
 	headlessHandlers,
@@ -178,12 +147,7 @@ await emit(
 await sleep(50);
 if (fs.existsSync(sockPath)) fail("a UI-less session claimed the socket");
 
-// session_start suspends across the stale-socket probes, so a session that is
-// disposed in that window resumes after its own cleanup() — and after the host
-// has already dropped its managed timers. Binding there leaves a server and a
-// heal interval holding a disposed ctx that nothing can clear: the next tick
-// rebuilds the socket against the dead session, whose widget then swallows the
-// live session's active file.
+// Shut down while session_start awaits its stale-socket probes.
 const abortedSession = makeSessionManager("aborted-1");
 const abortedHandlers = await loadExtension();
 const abortedCtx = ctxFor(abortedSession);
@@ -201,10 +165,7 @@ if (fs.existsSync(sockPath)) {
 	fail("session_start claimed the socket after its session was disposed");
 }
 
-// A failed listen() nulls state.server asynchronously, so the same session
-// claiming again skips the cleanup() at the top of session_start. Without
-// dropping the old handle first, the second claim overwrites state.healTimer
-// and the first interval keeps ticking with nothing left to clear it.
+// A failed listen() nulls state.server, so a second session_start skips cleanup().
 fs.mkdirSync(sockPath, { recursive: true }); // occupy the path: listen() fails
 const reclaimer = makeSessionManager("reclaim-1");
 const reclaimHandlers = await loadExtension();
@@ -221,7 +182,6 @@ fs.rmSync(sockPath, { recursive: true, force: true });
 fs.rmSync(infoPath, { force: true });
 if (timerCount() !== 0) fail("reclaim shutdown left a heal timer running");
 
-// Interactive session claims the socket.
 const owner = makeSessionManager("session-1");
 const ownerHandlers = await loadExtension();
 await emit(ownerHandlers, "session_start", ctxFor(owner));
@@ -231,11 +191,8 @@ await waitFor(
 );
 const ownerInode = fs.statSync(sockPath).ino;
 
-// An Nvim-like client publishes its active file.
 const client = net.connect(sockPath);
 await new Promise((resolve) => client.on("connect", resolve));
-// cleanup() must destroy accepted pipes: server.close() stops the listener
-// only, so without it Nvim never sees EOF and keeps writing to a dead session.
 let clientClosed = false;
 client.on("close", () => {
 	clientClosed = true;
@@ -245,7 +202,6 @@ client.write(
 );
 await waitFor(() => widget.value?.[0] === "lua/omp/init.lua:1", "the widget");
 
-// A subagent session, with its own copy of the module, must not rebind...
 const subagent = makeSessionManager("session-2");
 const subagentHandlers = await loadExtension();
 await emit(subagentHandlers, "session_start", ctxFor(subagent));
@@ -254,7 +210,6 @@ if (!fs.existsSync(sockPath) || fs.statSync(sockPath).ino !== ownerInode) {
 	fail("subagent session_start rebound the interactive session's socket");
 }
 
-// ...nor tear down the socket, .info file or widget when it finishes.
 await emit(subagentHandlers, "session_shutdown", ctxFor(subagent));
 await sleep(50);
 if (!fs.existsSync(sockPath) || !fs.existsSync(infoPath)) {
@@ -264,32 +219,34 @@ if (widget.value?.[0] !== "lua/omp/init.lua:1") {
 	fail("subagent session_shutdown cleared the widget");
 }
 
-// Context injection works from any module copy, because the state is shared,
-// and appends its own message instead of editing the user's — rewriting the
-// tail of persisted history moves the provider's prompt-cache breakpoints.
-const userMsg = { role: "user", content: "hi" };
-const contextHandler = subagentHandlers.get("context")?.[0];
-if (!contextHandler) fail("no context handler registered");
-const injected = contextHandler({ messages: [userMsg] }, undefined) as
-	| { messages: { role: string; content: { text: string }[] }[] }
+const ownerPrompt = ownerHandlers.get("before_agent_start")?.[0];
+const subagentPrompt = subagentHandlers.get("before_agent_start")?.[0];
+if (!ownerPrompt || !subagentPrompt) {
+	fail("no before_agent_start handler registered");
+}
+const promptEvent = {
+	type: "before_agent_start",
+	reason: "prompt",
+	prompt: "hi",
+	systemPrompt: [],
+};
+if (subagentPrompt(promptEvent, ctxFor(subagent)) !== undefined) {
+	fail("a subagent prompt got the active file");
+}
+const injected = ownerPrompt(promptEvent, ctxFor(owner)) as
+	| { message?: { content: string; display?: boolean; attribution?: string } }
 	| undefined;
-if (injected?.messages.length !== 2) {
-	fail("context hook did not append a message");
+if (!injected?.message?.content.includes("Active file: lua/omp/init.lua:1")) {
+	fail("the owner's prompt did not get the active file");
 }
-if (userMsg.content !== "hi") {
-	fail("context hook mutated the user's message");
+if (injected.message.display !== false) {
+	fail("the active-file note is shown in the transcript");
 }
-if (
-	!injected.messages[1]?.content[0]?.text.includes(
-		"Active file: lua/omp/init.lua:1",
-	)
-) {
-	fail("context hook did not inject the active file");
+// "agent" turns it into a trailing system message on Opus 4.8+ (oh-my-pi#15881).
+if (injected.message.attribution === "agent") {
+	fail("the active-file note is agent-attributed");
 }
 
-// Self-heal, .info-only case (macOS reaps $TMPDIR files while the server still
-// listens). Rewriting the info file must keep the listener and its accepted
-// pipes; closing and re-listening would unlink the healthy socket first.
 const heal = healTicks[0];
 if (!heal) fail("session_start registered no heal timer");
 fs.unlinkSync(infoPath);
@@ -302,8 +259,6 @@ if (JSON.parse(fs.readFileSync(infoPath, "utf8")).cwd !== process.cwd()) {
 	fail("rewritten .info file has the wrong cwd");
 }
 
-// The heal runs on a timer so an idle session stays discoverable; a repeat reap
-// seconds later must be repaired too, with no rate limit to burn.
 fs.unlinkSync(infoPath);
 heal();
 await waitFor(
@@ -314,8 +269,6 @@ if (fs.statSync(sockPath).ino !== ownerInode) {
 	fail("repeat self-heal rebuilt the server instead of rewriting .info");
 }
 
-// The owner's own shutdown must still clean up after the host re-mints its
-// session id (/new, resume and /tree all do this on a live session).
 owner.getSessionId = () => "session-1-branched";
 await emit(ownerHandlers, "session_shutdown", ctxFor(owner));
 await sleep(50);
@@ -330,10 +283,7 @@ if (timerCount() !== 0) {
 }
 await waitFor(() => clientClosed, "the client pipe to see EOF on cleanup");
 
-// An unwritable runtime dir (read-only $XDG_RUNTIME_DIR, or /run/user/<uid>
-// missing) must not throw out of session_start — the host awaits it — and must
-// not claim the socket either: a claim without a listener locks out every later
-// session, and ensureListening() cannot recover one whose socketPath is null.
+// An unwritable runtime dir must neither throw nor claim the socket.
 lockedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-nvim-locked-"));
 fs.chmodSync(lockedRoot, 0o500);
 let writable = true;
@@ -350,8 +300,6 @@ if (writable) {
 	await emit(lockedHandlers, "session_start", ctxFor(makeSessionManager("s3")));
 	await sleep(50);
 
-	// Same process, working runtime dir again: the refused session left nothing
-	// claimed, so this one must bind normally.
 	process.env.XDG_RUNTIME_DIR = runtimeDir;
 	const recovered = makeSessionManager("s4");
 	const recoveredHandlers = await loadExtension();
@@ -363,11 +311,8 @@ if (writable) {
 	await emit(recoveredHandlers, "session_shutdown", ctxFor(recovered));
 }
 
-// A heal that can never succeed (read-only runtime dir, a peer holding our
-// path) still retries every tick, but an identical failure must be reported
-// once, not once per tick: at a 15s period that is ~5.7k/day on the extension
-// error channel. A *different* failure still reports, recovery reports, and a
-// later outage is not silenced by the earlier one.
+// Identical heal failures log once; a changed failure, recovery and a later
+// outage each log again.
 noisyRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-nvim-noisy-"));
 let noisyLocks = true;
 try {
@@ -375,9 +320,7 @@ try {
 	fs.chmodSync(noisyRoot, 0o500);
 	fs.mkdirSync(path.join(noisyRoot, "probe2"));
 	noisyLocks = false;
-} catch {
-	// 0o500 denies us, which is what this test needs.
-}
+} catch {}
 fs.chmodSync(noisyRoot, 0o700);
 if (!noisyLocks) {
 	console.log("SKIP: runtime dir is writable despite 0o500 (running as root?)");
@@ -403,9 +346,7 @@ if (!noisyLocks) {
 		}
 	};
 
-	// Snapshotted through a function: reading the counter fields directly lets
-	// the compiler narrow them to the literal the first assertion proved, and
-	// the second assertion then looks unreachable.
+	// A function, so TS doesn't narrow the counters to literals.
 	const totals = (): { info: number; error: number } => ({
 		info: logCounts.info,
 		error: logCounts.error,
@@ -422,10 +363,8 @@ if (!noisyLocks) {
 		);
 	}
 
-	// Same outage, different blocker: the directory becomes writable but the
-	// socket path is occupied, so listen() now fails where mkdir used to. A
-	// dedupe keyed on "already reported this outage" would hide the errno that
-	// actually describes the session's current state.
+	// Directory writable again but the socket path occupied: listen() now fails
+	// instead of mkdir.
 	fs.chmodSync(noisyRoot, 0o700);
 	fs.mkdirSync(noisySock, { recursive: true });
 	await drive(2);

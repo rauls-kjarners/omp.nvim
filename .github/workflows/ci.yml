@@ -48,9 +48,8 @@ jobs:
         run: luacheck lua/ tests/
 
       - name: Run Lua Tests
-        # Globbed, not listed: a hand-maintained list silently never runs a new
-        # tests/*.lua file. Each file gets its own Neovim, which the suites that
-        # latch module state at load time require.
+        # Globbed so new files run; one Neovim per file because some suites
+        # latch module state at load time.
         run: |
           status=0
           for f in tests/*.lua; do
@@ -59,9 +58,7 @@ jobs:
           done
           exit $status
 
-  # The README advertises a minimum host version. Without this job that claim
-  # decays silently: nothing stops a commit from reaching for an API that only
-  # exists in a later release. Floor and current pin both run the socket suite.
+  # Holds the README's minimum host version to the code, next to the latest.
   extension:
     runs-on: ${{ matrix.os }}
     permissions:
@@ -70,7 +67,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        host: ["18.2.1", "^18.2.11"]
+        host: ["18.11.3", "^18.11.3"]
     steps:
       - uses: actions/checkout@v7
 
@@ -86,12 +83,9 @@ jobs:
       - name: Pin host to ${{ matrix.host }}
         run: npm install --no-save "@oh-my-pi/pi-coding-agent@${{ matrix.host }}"
 
-      # Read the manifest off disk: `npm ls` exits 1 when the installed version
-      # sits outside the package.json range, which is exactly what the floor leg
-      # does, and `require()` cannot reach it past the host's exports map.
-      # Asserted, not printed: a print step cannot fail, so a floor leg that
-      # silently resolved to the current release would report green while
-      # testing nothing it claims to test.
+      # Read off disk: `npm ls` fails outside the package.json range and
+      # require() cannot pass the host's exports map. Asserted so a floor leg
+      # that resolved to the latest release fails instead of passing.
       - name: Assert resolved host version
         env:
           SPEC: ${{ matrix.host }}

@@ -17,7 +17,7 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
 ## Requirements
 
 - Neovim >= 0.10.0
-- Oh My Pi >= 18.2.1
+- Oh My Pi >= 18.11.3
 
 ## Installation & Setup
 
@@ -58,7 +58,7 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
 
 ## Agent Behavior
 
-This plugin injects your active file path into the chat as passive background context — no extra setup required.
+This plugin adds your active file path to each prompt you send as hidden background context — no extra setup required.
 
 If you want to further tune how your agent handles this (or any other injected context), you
 can add your own rule to `~/.omp/agent/AGENTS.md`, but it's optional.
@@ -68,7 +68,7 @@ can add your own rule to `~/.omp/agent/AGENTS.md`, but it's optional.
 The project is split into two halves:
 
 1. **The Neovim Plugin (`lua/omp`):** A lightweight Lua script that hooks into `BufEnter`, `CursorMoved`, and `CursorHold` events. It actively tracks your focused file and broadcasts it via non-blocking `libuv` pipes to matching OMP sockets in `$XDG_RUNTIME_DIR/omp-nvim-sockets` (Linux) or the system temp directory (macOS).
-2. **The OMP Extension (`src/extension.ts`):** A native OMP extension that boots up alongside your terminal. It establishes a Unix domain socket and caches its location so Neovim can find it. It intercepts the active context and invisibly injects it into your prompts.
+2. **The OMP Extension (`src/extension.ts`):** A native OMP extension that boots up alongside your terminal. It establishes a Unix domain socket and caches its location so Neovim can find it. When you send a prompt, it attaches your active file as a hidden note right after it.
 
 Run `:checkhealth omp` inside Neovim to verify the integration is working correctly.
 
