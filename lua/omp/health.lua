@@ -3,7 +3,6 @@ local M = {}
 function M.check()
   vim.health.start("omp.nvim")
 
-  -- Neovim version
   local version = vim.version()
   local ver_str = string.format("%d.%d.%d", version.major, version.minor, version.patch)
   if version.major > 0 or version.minor >= 10 then
@@ -12,14 +11,12 @@ function M.check()
     vim.health.error("Neovim >= 0.10 required, found " .. ver_str)
   end
 
-  -- vim.uv availability
   if vim.uv then
     vim.health.ok("vim.uv available")
   else
     vim.health.error("vim.uv not available (upgrade to Neovim >= 0.10)")
   end
 
-  -- Sockets directory
   local omp = require("omp")
   local sockets_dir = omp._sockets_dir
   if type(sockets_dir) ~= "string" then
@@ -55,8 +52,6 @@ function M.check()
     vim.health.info("Sockets directory not yet created (will be on next setup()): " .. sockets_dir)
   end
 
-  -- fs_event watcher: primary discovery path. Without it, sessions started
-  -- while Neovim sits idle are only found on the next buffer/idle event.
   if type(omp._watcher_active) ~= "function" then
     vim.health.warn("omp module predates watcher diagnostics; restart Neovim after updating")
   elseif omp._watcher_active() then
@@ -68,9 +63,7 @@ function M.check()
     )
   end
 
-  -- Active OMP sessions. A pipe whose files are gone is still usable (macOS
-  -- deletes $TMPDIR entries older than 3 days under the running server), but it
-  -- means no new session can be discovered until OMP re-creates them.
+  -- A pipe whose socket file was reaped (macOS $TMPDIR) still works.
   local connected, connecting, orphaned = 0, 0, {}
   for socket_path, pipe in pairs(omp._active_sockets) do
     if pipe == true then
@@ -95,8 +88,6 @@ function M.check()
     vim.health.warn("Connected but socket file is gone (reaped or unlinked): " .. socket_path)
   end
 
-  -- What Neovim believes it has published. If OMP shows no active file while
-  -- this reports a path, the break is on the extension side, not here.
   if type(omp._broadcast_state) ~= "function" then
     vim.health.warn("omp module predates broadcast diagnostics; restart Neovim after updating")
   else
